@@ -15,6 +15,7 @@ open Arg
 (* Main flags for controlling driver behavior ------------------------------- *)
 let interpret = ref false
 let debugger = ref false
+let interleaved_interpret = ref None
 let optimize = ref false
 let emit_llvm = ref false
 
@@ -160,6 +161,18 @@ let args =
     , "debug an ll program (use `h` at prompt to get help)"
     )
 
+  ; ( "-interleave"
+    , Tuple
+        [ String (fun left -> interleaved_interpret := Some (left, ""))
+        ; String
+            (fun right ->
+              match !interleaved_interpret with
+              | Some (left, "") -> interleaved_interpret := Some (left, right)
+              | _ -> assert false)
+        ]
+    , "interleave two ll programs (driver stub)"
+    )
+
   ; ( "-v"
     , Set Platform.verbose
     , "enables more verbose compilation output"
@@ -174,7 +187,12 @@ let main () =
     Arg.parse args process_file
       "USAGE: ./vellvm [options] <files>\n" ;
     let prog = TopLevel.link_all !link_files [] in
-    if !interpret then
+    if Option.is_some !interleaved_interpret then
+      match !interleaved_interpret with
+      | Some (left, right) ->
+          Interleave.interleave !command_line_args !link_files left right
+      | None -> assert false
+    else if !interpret then
       match Interpreter.interpret !command_line_args prog with
       | Ok dv ->
          Printf.printf "Program terminated with: %s\n" (Interpreter.string_of_dvalue dv)
