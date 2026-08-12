@@ -160,6 +160,11 @@ let args =
     , "debug an ll program (use `h` at prompt to get help)"
     )
 
+  ; ( "-skip-init"
+    , Set Interpreter.skip_init
+    , "start the debugger at @main, after global and argv initialization"
+    )
+
   ; ( "-v"
     , Set Platform.verbose
     , "enables more verbose compilation output"

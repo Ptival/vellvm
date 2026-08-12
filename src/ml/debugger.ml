@@ -41,27 +41,21 @@ type debug_state =
     mutable max_breakpoint : int;
   }
 
-let last_line = ref (Camlcoq.camlstring_of_coqstring (LLVMEvents.printer_object.printer_get_loc ()))
-let current_line = ref (Camlcoq.camlstring_of_coqstring (LLVMEvents.printer_object.printer_get_loc ()))
 let state = ref { breakpoints = Hashtbl.create 0; max_breakpoint = 0; }
 
-let debug_raw_step m =
-  (match single_step m with
-  | Either.Left x ->
-     let loc_str = Camlcoq.camlstring_of_coqstring (LLVMEvents.printer_object.printer_get_loc ()) in
-     last_line := !current_line;
-     current_line := loc_str;
-     Either.Left x
-  | res -> res)
-
 (* Step will step into function calls *)
-let rec step m =
-  (match debug_raw_step m with
-  | Either.Left x ->
-     if !current_line = "" || !current_line = !last_line
-     then step x
-     else Either.Left x
-  | res -> res)
+let step m =
+  let start_location = current_location () in
+  let rec advance tree =
+    match single_step tree with
+    | Either.Left next ->
+       let location = current_location () in
+       if location = "" || location = start_location
+       then advance next
+       else Either.Left next
+    | res -> res
+  in
+  advance m
 
 (* Next will skip over function calls *)
 let rec next_helper level m =
@@ -118,7 +112,7 @@ let rec continue m =
   (* Use next to skip past any current breakpoints *)
   (match next m with
   | Either.Left x ->
-     if breakpoint_match !current_line
+     if breakpoint_match (current_location ())
      then Either.Left x
      else continue x
   | res -> res)
@@ -241,4 +235,11 @@ let vellvm_debugger
   Out_channel.set_buffered stdout false;
   Out_channel.set_buffered stderr false;
   let prog = (TopLevel.interpreter (List.map Camlcoq.coqstring_of_camlstring args) prog) in
-  debugger prog
+  (* This entry is always @main, so its frame is the first one pushed. *)
+  if !skip_init then
+    match skip_initialization ~frames:1 prog with
+    | Either.Left prog ->
+       Printf.printf "Program is at %s, past initialization.\n" (current_location ());
+       debugger prog
+    | Either.Right result -> result
+  else debugger prog

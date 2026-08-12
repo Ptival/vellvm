@@ -49,6 +49,11 @@ let string_of_bytes (bytes : Integers.bit_int list) : bytes =
 
 let debug_flag = ref false
 
+(** Set by [-skip-init]: advance past the initialization of the global
+    environment before handing the program to the debugger or the interleaver,
+    rather than making the user step through it. *)
+let skip_init = ref false
+
 (** Print a debug message to stdout if the `debug_flag` is enabled.
 
     This is used to implement `debugE` events.
@@ -67,7 +72,10 @@ let debug (msg : string) =
     or return the dvalue result returned from the itree.
  *)
 
-let current_line = ref (Camlcoq.camlstring_of_coqstring (LLVMEvents.printer_object.printer_get_loc ()))
+let current_location () =
+  Camlcoq.camlstring_of_coqstring (LLVMEvents.printer_object.printer_get_loc ())
+
+let current_line = ref (current_location ())
 
 (* Mirrors [InterpretationStack.Res dvalue] = [FusedS * dvalue]. *)
 type interp_state =
@@ -81,7 +89,7 @@ let single_step (m : (__ coq_MCFGEbot, interp_state) itree)
   (* Internal steps compute as nothing *)
   | TauF x ->
      if !debug_flag then begin
-         let loc_str = Camlcoq.camlstring_of_coqstring (LLVMEvents.printer_object.printer_get_loc ()) in
+         let loc_str = current_location () in
          if loc_str <> !current_line then begin
              Printf.printf "%s\n%!" loc_str;
              current_line := loc_str
@@ -142,6 +150,39 @@ let rec step (m : (__ coq_MCFGEbot, interp_state) itree)
   match single_step m with
   | Either.Left x -> step x
   | Either.Right res -> res
+
+let stack_depth () =
+  List.length ((Stack.local_stack_object params).local_stack_get ())
+
+(** Advance to the first instruction of the function the run starts from, past
+    the global environment that [denote_vellvm] builds before the entry is ever
+    called (and past `argv`, when the run starts at @main).
+
+    Returns the program stopped at that point, or its result if it terminated
+    first, which for a well-formed program means initialization itself failed. *)
+let skip_initialization ~(frames : int) (m : (__ coq_MCFGEbot, interp_state) itree)
+    : ((__ coq_MCFGEbot, interp_state) itree,
+       (DV.dvalue, exit_condition) result) Either.t =
+  let target = stack_depth () + frames in
+  (* In order to reach the beginning of the function we're interested in, we:
+     1. step until its stack frame appears, and then,
+     2. step until the current location changes, which means we entered the
+        function proper. *)
+  let rec step_until_function_entered caller m =
+    if current_location () <> caller || stack_depth () < target then Either.Left m
+    else
+      match single_step m with
+      | Either.Left next -> step_until_function_entered caller next
+      | Either.Right result -> Either.Right result
+  in
+  let rec step_until_frame_appears m =
+    if stack_depth () >= target then step_until_function_entered (current_location ()) m
+    else
+      match single_step m with
+      | Either.Left next -> step_until_frame_appears next
+      | Either.Right result -> Either.Right result
+  in
+  step_until_frame_appears m
 
 (** Interpret an LLVM program, returning a result that contains either the
     dvalue result returned by the LLVM program, or an error message.
