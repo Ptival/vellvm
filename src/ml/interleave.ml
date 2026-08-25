@@ -1,12 +1,19 @@
 (* Driver scaffolding for interleaved execution of two LLVM programs. *)
 open VellvmLib
 
-let build_itree args link_files path =
+(* Load one side of the interleaving, returning its itree and, when the entry was
+   chosen with [-entry], a description of the call it starts from. With no
+   [-entry] this is the usual whole-program run from @main; either way
+   [denote_vellvm] initializes the globals before reaching the entry. *)
+let build_itree args link_files (path, entry) =
   let ast = IO.parse_file path in
   let linked_ast = TopLevel.link_all link_files ast in
-  TopLevel.interpreter
-    (List.map Camlcoq.coqstring_of_camlstring args)
-    linked_ast
+  match entry with
+  | None ->
+      (TopLevel.interpreter (List.map Camlcoq.coqstring_of_camlstring args) linked_ast, None)
+  | Some spec ->
+      let resolved = Entry.resolve ~context:(Filename.basename path) linked_ast spec in
+      (Entry.interpreter resolved linked_ast, Some (Entry.describe resolved))
 
 type focus = Left | Right
 
@@ -323,11 +330,17 @@ let interleave_itrees left right =
     }
     Left None
 
-let interleave args link_files left_path right_path =
+(* Each side is given its own (path, entry) pair: the two programs are resolved
+   independently, so they may start from different arguments. *)
+let interleave args link_files (left_path, _ as left_side) (right_path, _ as right_side) =
   Out_channel.set_buffered stdout false;
   Out_channel.set_buffered stderr false;
-  let left = build_itree args link_files left_path in
-  let right = build_itree args link_files right_path in
-  Printf.printf " Left file: %s\n" (Filename.basename left_path);
-  Printf.printf "Right file: %s\n" (Filename.basename right_path);
+  let left, left_entry = build_itree args link_files left_side in
+  let right, right_entry = build_itree args link_files right_side in
+  let describe path = function
+    | None -> Filename.basename path
+    | Some entry -> Printf.sprintf "%s, from %s" (Filename.basename path) entry
+  in
+  Printf.printf " Left file: %s\n" (describe left_path left_entry);
+  Printf.printf "Right file: %s\n" (describe right_path right_entry);
   interleave_itrees left right;

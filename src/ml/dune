@@ -20,5 +20,6 @@
 (executables
  (names main)
  (modes byte exe)
- (modules main driver result interpreter assertion test frontendTest debugger interleave)
+ (modules main driver result interpreter assertion test frontendTest debugger interleave
+          entry)
  (libraries vellvmLib extracted libvellvm unix str))

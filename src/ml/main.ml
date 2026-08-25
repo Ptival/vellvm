@@ -16,6 +16,12 @@ open Arg
 let interpret = ref false
 let debugger = ref false
 let interleaved_interpret = ref None
+let entry_function = ref None
+let entry_function_left = ref None
+let entry_function_right = ref None
+let entry_args = ref None
+let entry_args_left = ref None
+let entry_args_right = ref None
 let optimize = ref false
 let emit_llvm = ref false
 
@@ -173,6 +179,48 @@ let args =
     , "interleave two ll programs (driver stub)"
     )
 
+  ; ( "-entry"
+    , String (fun name -> entry_function := Some name)
+    , "start BOTH programs from the given function instead of 'main'\n\
+       \tonly supported by -interleave, and the function must be defined in\n\
+       \tboth programs. Globals are still allocated and initialized, but\n\
+       \tnothing that 'main' would have set up is: no argv (-args is ignored),\n\
+       \tempty heap. Without -entry-args, arguments default to zero/null.\n\
+       \tIncompatible with -entry-left and -entry-right."
+    )
+
+  ; ( "-entry-left"
+    , String (fun name -> entry_function_left := Some name)
+    , "start the left program from the given function; must be paired with\n\
+       \t-entry-right, and is incompatible with -entry"
+    )
+
+  ; ( "-entry-right"
+    , String (fun name -> entry_function_right := Some name)
+    , "start the right program from the given function; must be paired with\n\
+       \t-entry-left, and is incompatible with -entry"
+    )
+
+  ; ( "-entry-args"
+    , String (fun args -> entry_args := Some args)
+    , "arguments for the entry of BOTH programs, as a comma-separated list of typed\n\
+       \tLLVM literals, e.g. -entry-args 'i64 3, i8* null'. Same syntax as the\n\
+       \targuments of a call in an ASSERT directive, hence the same restrictions:\n\
+       \tpointers must be null, since these arguments are built without touching\n\
+       \tmemory, and aggregate types must be spelled out structurally, as in\n\
+       \t'{i32, i32} {i32 3, i32 4}' rather than '%pair {i32 3, i32 4}'."
+    )
+
+  ; ( "-entry-args-left"
+    , String (fun args -> entry_args_left := Some args)
+    , "arguments for the entry of the left program only, overriding -entry-args"
+    )
+
+  ; ( "-entry-args-right"
+    , String (fun args -> entry_args_right := Some args)
+    , "arguments for the entry of the right program only, overriding -entry-args"
+    )
+
   ; ( "-v"
     , Set Platform.verbose
     , "enables more verbose compilation output"
@@ -187,10 +235,44 @@ let main () =
     Arg.parse args process_file
       "USAGE: ./vellvm [options] <files>\n" ;
     let prog = TopLevel.link_all !link_files [] in
+    (* The two programs are entered independently. The entry itself is chosen
+       either once for both sides with -entry or per side with
+       -entry-left/-entry-right, and the two schemes are mutually exclusive.
+       Arguments, in contrast, layer: a side's own -entry-args-<side> wins over
+       the -entry-args shared by both, which in turn wins over defaults built
+       from that side's own prototype. *)
+    let left_name, right_name =
+      match (!entry_function, !entry_function_left, !entry_function_right) with
+      | Some _, Some _, _ | Some _, _, Some _ ->
+          failwith "-entry is incompatible with -entry-left and -entry-right"
+      | Some shared, None, None -> (Some shared, Some shared)
+      | None, (Some _ as left), (Some _ as right) -> (left, right)
+      | None, Some _, None | None, None, Some _ ->
+          failwith
+            "-entry-left and -entry-right must be given together (use -entry to \
+             enter both programs at the same function)"
+      | None, None, None -> (None, None)
+    in
+    let entry_of name side_args =
+      match name with
+      | None -> None
+      | Some name ->
+          let args = if Option.is_some side_args then side_args else !entry_args in
+          Some Entry.{name; args}
+    in
+    let left_entry = entry_of left_name !entry_args_left in
+    let right_entry = entry_of right_name !entry_args_right in
+    if Option.is_none left_entry
+       && List.exists Option.is_some [!entry_args; !entry_args_left; !entry_args_right]
+    then failwith "-entry-args requires -entry, or -entry-left and -entry-right" ;
+    if Option.is_some left_entry && not (Option.is_some !interleaved_interpret) then
+      failwith
+        "-entry (and -entry-left/-entry-right) is currently only supported by -interleave" ;
     if Option.is_some !interleaved_interpret then
       match !interleaved_interpret with
       | Some (left, right) ->
-          Interleave.interleave !command_line_args !link_files left right
+          Interleave.interleave !command_line_args !link_files (left, left_entry)
+            (right, right_entry)
       | None -> assert false
     else if !interpret then
       match Interpreter.interpret !command_line_args prog with
