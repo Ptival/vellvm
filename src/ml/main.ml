@@ -22,6 +22,9 @@ let entry_function_right = ref None
 let entry_args = ref None
 let entry_args_left = ref None
 let entry_args_right = ref None
+let entry_buffers = ref []
+let entry_buffers_left = ref []
+let entry_buffers_right = ref []
 let optimize = ref false
 let emit_llvm = ref false
 
@@ -30,12 +33,23 @@ let emit_llvm = ref false
 (* Files linked by reference to a directory via -L *)
 let link_files : TopLevel.ll_toplevel_entities list ref = ref []
 
+(* Files linked into one side of an interleaving only, via -link-left and
+   -link-right. This is where a hand-written harness goes when the generated one
+   is not enough: the two sides usually need different setup code, and -l/-L link
+   into both. *)
+let link_files_left : TopLevel.ll_toplevel_entities list ref = ref []
+let link_files_right : TopLevel.ll_toplevel_entities list ref = ref []
+
 let add_link_ast ast =
   link_files := ast :: !link_files
 
 let link_file path =
   let _ = Platform.verb @@ Printf.sprintf "* linking file: %s" path in
   add_link_ast (IO.parse_file path)
+
+let link_file_into side name path =
+  let _ = Platform.verb @@ Printf.sprintf "* linking file (%s only): %s" name path in
+  side := IO.parse_file path :: !side
 
 (* Include all .ll files from the given directory *)
 let link_dir dir =
@@ -204,11 +218,15 @@ let args =
   ; ( "-entry-args"
     , String (fun args -> entry_args := Some args)
     , "arguments for the entry of BOTH programs, as a comma-separated list of typed\n\
-       \tLLVM literals, e.g. -entry-args 'i64 3, i8* null'. Same syntax as the\n\
-       \targuments of a call in an ASSERT directive, hence the same restrictions:\n\
-       \tpointers must be null, since these arguments are built without touching\n\
-       \tmemory, and aggregate types must be spelled out structurally, as in\n\
-       \t'{i32, i32} {i32 3, i32 4}' rather than '%pair {i32 3, i32 4}'."
+       \tLLVM literals, e.g. -entry-args 'i64 3, i8* null'.\n\
+       \tWithout -entry-buffer these are built without touching memory, using the\n\
+       \tsame syntax as the arguments of a call in an ASSERT directive and hence\n\
+       \twith the same restrictions: pointers must be null, and aggregate types\n\
+       \tmust be spelled out structurally, as in '{i32, i32} {i32 3, i32 4}'\n\
+       \trather than '%pair {i32 3, i32 4}'.\n\
+       \tWith -entry-buffer they become the arguments of a real call in the\n\
+       \tgenerated harness, which lifts both restrictions: they may name buffers\n\
+       \t(e.g. 'ptr %in, i32 5') and use the program's own type names."
     )
 
   ; ( "-entry-args-left"
@@ -219,6 +237,49 @@ let args =
   ; ( "-entry-args-right"
     , String (fun args -> entry_args_right := Some args)
     , "arguments for the entry of the right program only, overriding -entry-args"
+    )
+
+  ; ( "-entry-buffer"
+    , String (fun buffer -> entry_buffers := buffer :: !entry_buffers)
+    , "allocate memory before calling the entry of BOTH programs, and pass it by\n\
+       \treference. May be repeated; each occurrence is\n\
+       \t  -entry-buffer 'name : <type>'                  (allocate only)\n\
+       \t  -entry-buffer 'name : <type> = <initializer>'  (allocate and store)\n\
+       \tas in -entry-buffer 'in : [5 x i32] = [i32 1, i32 2, i32 3, i32 4, i32 5]'.\n\
+       \tRefer to a buffer as '%name' in -entry-args, and in the initializer of\n\
+       \tany other buffer: every buffer is allocated before any is initialized,\n\
+       \tso the references may go in either direction, or in a cycle.\n\
+       \tGiving a buffer switches that side to running through a generated\n\
+       \tharness (see -show-harness) instead of calling the entry directly."
+    )
+
+  ; ( "-entry-buffer-left"
+    , String (fun buffer -> entry_buffers_left := buffer :: !entry_buffers_left)
+    , "a buffer for the left program only; may be repeated. If any is given, the\n\
+       \tleft program uses these buffers instead of the -entry-buffer ones"
+    )
+
+  ; ( "-entry-buffer-right"
+    , String (fun buffer -> entry_buffers_right := buffer :: !entry_buffers_right)
+    , "a buffer for the right program only; may be repeated. If any is given, the\n\
+       \tright program uses these buffers instead of the -entry-buffer ones"
+    )
+
+  ; ( "-link-left"
+    , String (link_file_into link_files_left "left")
+    , "link one .ll file into the left program only; may be repeated. Unlike -l,\n\
+       \twhich links into both, this is where a hand-written harness for one side\n\
+       \tgoes: define a function there and name it with -entry-left"
+    )
+
+  ; ( "-link-right"
+    , String (link_file_into link_files_right "right")
+    , "link one .ll file into the right program only; may be repeated"
+    )
+
+  ; ( "-show-harness"
+    , Set Entry.show_harness
+    , "print the harness generated from -entry-buffer for each side"
     )
 
   ; ( "-v"
@@ -253,26 +314,36 @@ let main () =
              enter both programs at the same function)"
       | None, None, None -> (None, None)
     in
-    let entry_of name side_args =
+    let entry_of name side_args side_buffers =
       match name with
       | None -> None
       | Some name ->
           let args = if Option.is_some side_args then side_args else !entry_args in
-          Some Entry.{name; args}
+          let buffers = if side_buffers <> [] then side_buffers else !entry_buffers in
+          (* The flags accumulate in reverse; the buffers keep the order they
+             were given in, which is the order they are allocated in. *)
+          Some Entry.{name; args; buffers = List.rev buffers}
     in
-    let left_entry = entry_of left_name !entry_args_left in
-    let right_entry = entry_of right_name !entry_args_right in
+    let left_entry = entry_of left_name !entry_args_left !entry_buffers_left in
+    let right_entry = entry_of right_name !entry_args_right !entry_buffers_right in
     if Option.is_none left_entry
-       && List.exists Option.is_some [!entry_args; !entry_args_left; !entry_args_right]
-    then failwith "-entry-args requires -entry, or -entry-left and -entry-right" ;
+       && (List.exists Option.is_some [!entry_args; !entry_args_left; !entry_args_right]
+          || List.exists (( <> ) []) [!entry_buffers; !entry_buffers_left; !entry_buffers_right])
+    then
+      failwith
+        "-entry-args and -entry-buffer require -entry, or -entry-left and -entry-right" ;
     if Option.is_some left_entry && not (Option.is_some !interleaved_interpret) then
       failwith
         "-entry (and -entry-left/-entry-right) is currently only supported by -interleave" ;
+    if (!link_files_left <> [] || !link_files_right <> [])
+       && not (Option.is_some !interleaved_interpret)
+    then failwith "-link-left and -link-right are only supported by -interleave" ;
     if Option.is_some !interleaved_interpret then
       match !interleaved_interpret with
       | Some (left, right) ->
-          Interleave.interleave !command_line_args !link_files (left, left_entry)
-            (right, right_entry)
+          Interleave.interleave !command_line_args !link_files
+            {Interleave.path = left; entry = left_entry; links = List.rev !link_files_left}
+            {Interleave.path = right; entry = right_entry; links = List.rev !link_files_right}
       | None -> assert false
     else if !interpret then
       match Interpreter.interpret !command_line_args prog with

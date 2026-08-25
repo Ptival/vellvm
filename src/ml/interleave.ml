@@ -1,19 +1,32 @@
 (* Driver scaffolding for interleaved execution of two LLVM programs. *)
 open VellvmLib
 
+(* One side of the interleaving: the program, the entry to start it from, and the
+   .ll files linked into this side only. The two sides most often need to differ
+   -- a different entry, different buffers, a different hand-written harness --
+   so everything that selects what to run is per side; only the files linked with
+   -l/-L are shared. *)
+type side =
+  { path : string;
+    entry : Entry.spec option;
+    links : TopLevel.ll_toplevel_entities list;
+  }
+
 (* Load one side of the interleaving, returning its itree and, when the entry was
    chosen with [-entry], a description of the call it starts from. With no
    [-entry] this is the usual whole-program run from @main; either way
    [denote_vellvm] initializes the globals before reaching the entry. *)
-let build_itree args link_files (path, entry) =
-  let ast = IO.parse_file path in
-  let linked_ast = TopLevel.link_all link_files ast in
-  match entry with
+let build_itree args shared_links side =
+  let ast = IO.parse_file side.path in
+  let linked_ast = TopLevel.link_all (side.links @ shared_links) ast in
+  match side.entry with
   | None ->
       (TopLevel.interpreter (List.map Camlcoq.coqstring_of_camlstring args) linked_ast, None)
   | Some spec ->
-      let resolved = Entry.resolve ~context:(Filename.basename path) linked_ast spec in
-      (Entry.interpreter resolved linked_ast, Some (Entry.describe resolved))
+      (* [resolve] may link a generated harness into the program, so the itree is
+         built from the program it hands back rather than from [linked_ast]. *)
+      let resolved = Entry.resolve ~context:(Filename.basename side.path) linked_ast spec in
+      (Entry.interpreter resolved, Some (Entry.describe resolved))
 
 type focus = Left | Right
 
@@ -330,17 +343,18 @@ let interleave_itrees left right =
     }
     Left None
 
-(* Each side is given its own (path, entry) pair: the two programs are resolved
-   independently, so they may start from different arguments. *)
-let interleave args link_files (left_path, _ as left_side) (right_path, _ as right_side) =
+(* Each side carries its own entry, buffers and link files: the two programs are
+   resolved independently, so they may start from different functions with
+   different arguments and different memory set up for them. *)
+let interleave args shared_links left_side right_side =
   Out_channel.set_buffered stdout false;
   Out_channel.set_buffered stderr false;
-  let left, left_entry = build_itree args link_files left_side in
-  let right, right_entry = build_itree args link_files right_side in
-  let describe path = function
-    | None -> Filename.basename path
-    | Some entry -> Printf.sprintf "%s, from %s" (Filename.basename path) entry
+  let left, left_entry = build_itree args shared_links left_side in
+  let right, right_entry = build_itree args shared_links right_side in
+  let describe side = function
+    | None -> Filename.basename side.path
+    | Some entry -> Printf.sprintf "%s, from %s" (Filename.basename side.path) entry
   in
-  Printf.printf " Left file: %s\n" (describe left_path left_entry);
-  Printf.printf "Right file: %s\n" (describe right_path right_entry);
+  Printf.printf " Left file: %s\n" (describe left_side left_entry);
+  Printf.printf "Right file: %s\n" (describe right_side right_entry);
   interleave_itrees left right;
