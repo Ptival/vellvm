@@ -1,31 +1,37 @@
 (* Driver scaffolding for interleaved execution of two LLVM programs. *)
 open VellvmLib
 
-(* One side of the interleaving: the program, the entry to start it from, and the
-   .ll files linked into this side only. The two sides most often need to differ
-   -- a different entry, different buffers, a different hand-written harness --
-   so everything that selects what to run is per side; only the files linked with
-   -l/-L are shared. *)
+(* One side of the interleaving: the program, the entry to start it from, the
+   `argv` to give @main when there is no entry, and the .ll files linked into this
+   side only. The two sides most often need to differ -- a different entry,
+   different buffers, a different hand-written harness -- so everything that
+   selects what to run is per side; only the files linked with -l/-L are shared.
+   This is what a `.vellvm` manifest describes, and what the -entry-* flags build
+   for a side named by a bare .ll file. *)
 type side =
-  { path : string;
+  { label : string;
+    path : string;
     entry : Entry.spec option;
+    argv : string list option;
     links : TopLevel.ll_toplevel_entities list;
   }
 
-(* Load one side of the interleaving, returning its itree and, when the entry was
-   chosen with [-entry], a description of the call it starts from. With no
-   [-entry] this is the usual whole-program run from @main; either way
-   [denote_vellvm] initializes the globals before reaching the entry. *)
+(* Load one side of the interleaving, returning its itree and, when an entry was
+   chosen, a description of the call it starts from. With no entry this is the
+   usual whole-program run from @main, with the side's own `argv` if it has one and
+   [-args] otherwise; either way [denote_vellvm] initializes the globals before
+   reaching the entry. *)
 let build_itree args shared_links side =
   let ast = IO.parse_file side.path in
   let linked_ast = TopLevel.link_all (side.links @ shared_links) ast in
   match side.entry with
   | None ->
-      (TopLevel.interpreter (List.map Camlcoq.coqstring_of_camlstring args) linked_ast, None)
+      let argv = Option.value side.argv ~default:args in
+      (TopLevel.interpreter (List.map Camlcoq.coqstring_of_camlstring argv) linked_ast, None)
   | Some spec ->
       (* [resolve] may link a generated harness into the program, so the itree is
          built from the program it hands back rather than from [linked_ast]. *)
-      let resolved = Entry.resolve ~context:(Filename.basename side.path) linked_ast spec in
+      let resolved = Entry.resolve ~context:side.label linked_ast spec in
       (Entry.interpreter resolved, Some (Entry.describe resolved))
 
 type focus = Left | Right
@@ -351,9 +357,16 @@ let interleave args shared_links left_side right_side =
   Out_channel.set_buffered stderr false;
   let left, left_entry = build_itree args shared_links left_side in
   let right, right_entry = build_itree args shared_links right_side in
-  let describe side = function
-    | None -> Filename.basename side.path
-    | Some entry -> Printf.sprintf "%s, from %s" (Filename.basename side.path) entry
+  (* The label is the manifest's [name:] when there is one, and the basename of
+     the program otherwise, in which case there is no point in printing both. *)
+  let describe side entry =
+    let program = Filename.basename side.path in
+    let program =
+      if side.label = program then program else Printf.sprintf "%s (%s)" side.label program
+    in
+    match entry with
+    | None -> program
+    | Some entry -> Printf.sprintf "%s, from %s" program entry
   in
   Printf.printf " Left file: %s\n" (describe left_side left_entry);
   Printf.printf "Right file: %s\n" (describe right_side right_entry);

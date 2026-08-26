@@ -16,17 +16,23 @@ open Arg
 let interpret = ref false
 let debugger = ref false
 let interleaved_interpret = ref None
+let run_target = ref None
 let entry_function = ref None
 let entry_function_left = ref None
 let entry_function_right = ref None
-let entry_args = ref None
-let entry_args_left = ref None
-let entry_args_right = ref None
-let entry_buffers = ref []
-let entry_buffers_left = ref []
-let entry_buffers_right = ref []
+let entry_args : Entry.written option ref = ref None
+let entry_args_left : Entry.written option ref = ref None
+let entry_args_right : Entry.written option ref = ref None
+let entry_buffers : Entry.written list ref = ref []
+let entry_buffers_left : Entry.written list ref = ref []
+let entry_buffers_right : Entry.written list ref = ref []
 let optimize = ref false
 let emit_llvm = ref false
+
+(* A request made by a flag, tagged with that flag so that an error about it can
+   say where it came from -- a run manifest tags its own requests with the line
+   they are written on instead. *)
+let written flag text = {Entry.text; origin = flag}
 
 (* Linking ------------------------------------------------------------------ *)
 
@@ -190,7 +196,33 @@ let args =
               | Some (left, "") -> interleaved_interpret := Some (left, right)
               | _ -> assert false)
         ]
-    , "interleave two ll programs (driver stub)"
+    , "interleave two ll programs (driver stub)\n\
+       \tEach of the two is either a .ll file, run from '@main' unless the -entry\n\
+       \tflags say otherwise, or a " ^ Manifest.extension ^ " run manifest, which says\n\
+       \tby itself what to link, where to start and with what memory (see -run)."
+    )
+
+  ; ( "-run"
+    , String (fun path -> run_target := Some path)
+    , "run one program as a " ^ Manifest.extension ^ " manifest describes it\n\
+       \t(with -debugger, debug it instead). A manifest is a line-oriented file\n\
+       \tholding what the -entry/-entry-args/-entry-buffer/-link-* flags hold:\n\
+       \t  ; comments start with ';' or '#'\n\
+       \t  name:    rust                 label for this program in the output\n\
+       \t  program: rewrite.ll           the .ll to run, relative to this file\n\
+       \t  link:    support/shims.ll     .ll to link in; repeatable\n\
+       \t  harness: <<LL                 LLVM to link in, up to a line reading LL\n\
+       \t    define i32 @go() { ... }\n\
+       \t  LL\n\
+       \t  entry:   @process             where to start, instead of @main\n\
+       \t  arg:     ptr %in              one argument; repeatable\n\
+       \t  buffer in: [2 x i32] = [i32 1, i32 2]   storage to allocate; repeatable\n\
+       \t  argv:    prog --flag          argv for @main, instead of an entry\n\
+       \t  include: common" ^ Manifest.extension ^ "        build on another manifest\n\
+       \tAn indented line continues the value above it, so a long initializer can\n\
+       \tbe folded. A path is relative to the file it is written in. Buffers are\n\
+       \tallocated in the order written, and 'argv:' excludes the entry keys.\n\
+       \tA .ll file given here means the manifest 'program: <that file>'."
     )
 
   ; ( "-entry"
@@ -216,7 +248,7 @@ let args =
     )
 
   ; ( "-entry-args"
-    , String (fun args -> entry_args := Some args)
+    , String (fun args -> entry_args := Some (written "-entry-args" args))
     , "arguments for the entry of BOTH programs, as a comma-separated list of typed\n\
        \tLLVM literals, e.g. -entry-args 'i64 3, i8* null'.\n\
        \tWithout -entry-buffer these are built without touching memory, using the\n\
@@ -230,17 +262,17 @@ let args =
     )
 
   ; ( "-entry-args-left"
-    , String (fun args -> entry_args_left := Some args)
+    , String (fun args -> entry_args_left := Some (written "-entry-args-left" args))
     , "arguments for the entry of the left program only, overriding -entry-args"
     )
 
   ; ( "-entry-args-right"
-    , String (fun args -> entry_args_right := Some args)
+    , String (fun args -> entry_args_right := Some (written "-entry-args-right" args))
     , "arguments for the entry of the right program only, overriding -entry-args"
     )
 
   ; ( "-entry-buffer"
-    , String (fun buffer -> entry_buffers := buffer :: !entry_buffers)
+    , String (fun buffer -> entry_buffers := written "-entry-buffer" buffer :: !entry_buffers)
     , "allocate memory before calling the entry of BOTH programs, and pass it by\n\
        \treference. May be repeated; each occurrence is\n\
        \t  -entry-buffer 'name : <type>'                  (allocate only)\n\
@@ -254,13 +286,17 @@ let args =
     )
 
   ; ( "-entry-buffer-left"
-    , String (fun buffer -> entry_buffers_left := buffer :: !entry_buffers_left)
+    , String
+        (fun buffer ->
+          entry_buffers_left := written "-entry-buffer-left" buffer :: !entry_buffers_left)
     , "a buffer for the left program only; may be repeated. If any is given, the\n\
        \tleft program uses these buffers instead of the -entry-buffer ones"
     )
 
   ; ( "-entry-buffer-right"
-    , String (fun buffer -> entry_buffers_right := buffer :: !entry_buffers_right)
+    , String
+        (fun buffer ->
+          entry_buffers_right := written "-entry-buffer-right" buffer :: !entry_buffers_right)
     , "a buffer for the right program only; may be repeated. If any is given, the\n\
        \tright program uses these buffers instead of the -entry-buffer ones"
     )
@@ -306,8 +342,10 @@ let main () =
       match (!entry_function, !entry_function_left, !entry_function_right) with
       | Some _, Some _, _ | Some _, _, Some _ ->
           failwith "-entry is incompatible with -entry-left and -entry-right"
-      | Some shared, None, None -> (Some shared, Some shared)
-      | None, (Some _ as left), (Some _ as right) -> (left, right)
+      | Some shared, None, None ->
+          (Some (shared, "-entry"), Some (shared, "-entry"))
+      | None, Some left, Some right ->
+          (Some (left, "-entry-left"), Some (right, "-entry-right"))
       | None, Some _, None | None, None, Some _ ->
           failwith
             "-entry-left and -entry-right must be given together (use -entry to \
@@ -317,12 +355,12 @@ let main () =
     let entry_of name side_args side_buffers =
       match name with
       | None -> None
-      | Some name ->
+      | Some (name, origin) ->
           let args = if Option.is_some side_args then side_args else !entry_args in
           let buffers = if side_buffers <> [] then side_buffers else !entry_buffers in
           (* The flags accumulate in reverse; the buffers keep the order they
              were given in, which is the order they are allocated in. *)
-          Some Entry.{name; args; buffers = List.rev buffers}
+          Some Entry.{name; origin; args; buffers = List.rev buffers}
     in
     let left_entry = entry_of left_name !entry_args_left !entry_buffers_left in
     let right_entry = entry_of right_name !entry_args_right !entry_buffers_right in
@@ -332,18 +370,118 @@ let main () =
     then
       failwith
         "-entry-args and -entry-buffer require -entry, or -entry-left and -entry-right" ;
-    if Option.is_some left_entry && not (Option.is_some !interleaved_interpret) then
+    if Option.is_some left_entry
+       && Option.is_none !interleaved_interpret
+       && Option.is_none !run_target
+    then
       failwith
-        "-entry (and -entry-left/-entry-right) is currently only supported by -interleave" ;
+        "-entry (and -entry-left/-entry-right) is currently only supported by -interleave \
+         and -run" ;
     if (!link_files_left <> [] || !link_files_right <> [])
        && not (Option.is_some !interleaved_interpret)
     then failwith "-link-left and -link-right are only supported by -interleave" ;
+    if Option.is_some !interleaved_interpret && Option.is_some !run_target then
+      failwith "-run runs one program; use -interleave for two" ;
+    (* Which flags were given, so that a conflict with a manifest can name all of
+       them at once. Nothing layers here: a manifest describes a whole run, so a
+       flag that describes part of one again is a contradiction rather than an
+       override, and picking a winner silently is how a run stops being the run
+       the manifest says it is. *)
+    let flags_given given =
+      List.filter_map (fun (flag, was_given) -> if was_given then Some flag else None) given
+    in
+    let shared_flags =
+      flags_given
+        [ ("-entry", Option.is_some !entry_function)
+        ; ("-entry-args", Option.is_some !entry_args)
+        ; ("-entry-buffer", !entry_buffers <> []) ]
+    in
+    let left_flags =
+      flags_given
+        [ ("-entry-left", Option.is_some !entry_function_left)
+        ; ("-entry-args-left", Option.is_some !entry_args_left)
+        ; ("-entry-buffer-left", !entry_buffers_left <> [])
+        ; ("-link-left", !link_files_left <> []) ]
+    in
+    let right_flags =
+      flags_given
+        [ ("-entry-right", Option.is_some !entry_function_right)
+        ; ("-entry-args-right", Option.is_some !entry_args_right)
+        ; ("-entry-buffer-right", !entry_buffers_right <> [])
+        ; ("-link-right", !link_files_right <> []) ]
+    in
+    (* One side of a run: a manifest says all of it, and a bare .ll says only
+       which program, leaving the rest to the flags. *)
+    let side_of_target ~(flags : string list) ~(entry : Entry.spec option)
+        ~(links : TopLevel.ll_toplevel_entities list) (path : string) =
+      let manifest = Manifest.load_target path in
+      if not (Manifest.is_manifest path) then
+        {Interleave.label = manifest.Manifest.label; path; entry; argv = None; links}
+      else begin
+        ( match flags with
+        | [] -> ()
+        | flags ->
+            failwith
+              (Printf.sprintf
+                 "%s already says how to run %s, so %s cannot be given as well: put it in \
+                  the manifest instead"
+                 path
+                 (Filename.basename manifest.Manifest.program)
+                 (String.concat " and " flags)) ) ;
+        let entry, argv =
+          match manifest.Manifest.run with
+          | Manifest.Default_argv -> (None, None)
+          | Manifest.Argv argv -> (None, Some argv)
+          | Manifest.From_entry spec -> (Some spec, None)
+        in
+        { Interleave.label = manifest.Manifest.label
+        ; path = manifest.Manifest.program
+        ; entry
+        ; argv
+        ; links = List.map Manifest.ast_of_source manifest.Manifest.links }
+      end
+    in
     if Option.is_some !interleaved_interpret then
       match !interleaved_interpret with
       | Some (left, right) ->
           Interleave.interleave !command_line_args !link_files
-            {Interleave.path = left; entry = left_entry; links = List.rev !link_files_left}
-            {Interleave.path = right; entry = right_entry; links = List.rev !link_files_right}
+            (side_of_target ~flags:(shared_flags @ left_flags) ~entry:left_entry
+               ~links:(List.rev !link_files_left) left)
+            (side_of_target ~flags:(shared_flags @ right_flags) ~entry:right_entry
+               ~links:(List.rev !link_files_right) right)
+      | None -> assert false
+    else if Option.is_some !run_target then
+      match !run_target with
+      | Some path ->
+          ( match left_flags @ right_flags with
+          | [] -> ()
+          | flags ->
+              failwith
+                (Printf.sprintf
+                   "%s names one of two programs, and -run runs one program: use -entry, \
+                    -entry-args and -entry-buffer, or a manifest"
+                   (String.concat " and " flags)) ) ;
+          let side = side_of_target ~flags:shared_flags ~entry:left_entry ~links:[] path in
+          Out_channel.set_buffered stdout false ;
+          Out_channel.set_buffered stderr false ;
+          let tree, entry_description =
+            Interleave.build_itree !command_line_args !link_files side
+          in
+          Printf.printf "Running %s%s\n" side.Interleave.label
+            (match entry_description with
+             | None -> ""
+             | Some description -> Printf.sprintf ", from %s" description) ;
+          let result =
+            if !debugger then begin
+              Interpreter.debug_flag := true ;
+              Debugger.debugger tree
+            end
+            else Interpreter.step tree
+          in
+          ( match result with
+          | Ok dv ->
+              Printf.printf "Program terminated with: %s\n" (Interpreter.string_of_dvalue dv)
+          | Error e -> failwith (Result.string_of_exit_condition e) )
       | None -> assert false
     else if !interpret then
       match Interpreter.interpret !command_line_args prog with
