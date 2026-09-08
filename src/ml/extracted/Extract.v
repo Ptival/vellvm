@@ -55,9 +55,11 @@ Extract Constant printer_object => "
   let printer_print_msg msg =
     print_string ((camlstring_of_coqstring (AstLib.location_string !loc_state)) ^ "": "" ^ (camlstring_of_coqstring msg) ^ ""\n"")
   in
+  let printer_get_loc_state = fun _ -> !loc_state in
   let printer_get_loc = fun _ -> AstLib.location_string !loc_state in
   { printer_set_loc;
     printer_print_msg;
+    printer_get_loc_state;
     printer_get_loc; }
   ".
 

@@ -1203,3 +1203,8 @@ define { i8, i1 } @llvm.uadd.with.overflow.i8(i8 noundef %0, i8 noundef %1) loca
   %fullres = insertvalue {i8, i1} %base, i1 %overflow, 1
   ret {i8, i1} %fullres
 }
+
+; Very incorrect!  Temporary workaround.
+define ptr @llvm.stacksave.p0() {
+  ret ptr null
+}

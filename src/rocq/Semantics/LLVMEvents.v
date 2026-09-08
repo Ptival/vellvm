@@ -162,11 +162,13 @@ Section withParams.
     mk_printer {
         printer_set_loc : option file_info -> string ;
         printer_print_msg : string -> unit ;
+        printer_get_loc_state : unit -> option file_info ;
         printer_get_loc : unit -> string ;
       }.
 
   Definition printer_object : printer :=
-    mk_printer (fun (_:option file_info) => "") (fun (_:string) => tt) (fun (_:unit) => "").
+    mk_printer (fun (_:option file_info) => "") (fun (_:string) => tt)
+      (fun (_:unit) => None) (fun (_:unit) => "").
 
   Definition set_loc : option file_info -> string := printer_object.(printer_set_loc).
   Definition print_msg : string -> unit := printer_object.(printer_print_msg).
@@ -235,4 +237,3 @@ Definition EOU_to_itree {E} `{FailureE -< E} `{OOME -< E} `{UBE -< E} :
           | raise_ub    s => raiseUB s
           | raise_ret   v => ret v
           end.
-

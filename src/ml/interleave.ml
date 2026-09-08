@@ -53,6 +53,7 @@ type command =
   | FocusLeft
   | FocusRight
   | Step
+  | StepITree
   | PrintLocals
   | PrintGlobals
   | PrintTree
@@ -61,6 +62,7 @@ type 'tree session =
   { mutable tree : 'tree option;
     mutable stack : Stack.stack_frame list;
     mutable globals : Global.global_env;
+    mutable location_state : LLVMAst.file_info option;
     mutable location : string;
   }
 
@@ -73,11 +75,13 @@ let read_command focus last_command =
   | "left" | "l" -> Some FocusLeft
   | "right" | "r" -> Some FocusRight
   | "step" | "s" -> Some Step
+  | "stepi" | "si" -> Some StepITree
   | "pl" -> Some PrintLocals
   | "pg" -> Some PrintGlobals
   | "pt" -> Some PrintTree
   | _ ->
-      Printf.printf "Invalid command. Expected left (l), right (r), step (s), pl, pg, or pt.\n";
+      Printf.printf
+        "Invalid command. Expected left (l), right (r), step (s), stepi (si), pl, pg, or pt.\n";
       None
 
 let report_result side = function
@@ -162,13 +166,16 @@ let publish_stack session =
 
 let publish_observers session =
   publish_globals session;
-  publish_stack session
+  publish_stack session;
+  ignore (LLVMEvents.printer_object.printer_set_loc session.location_state)
 
 let capture_observers session =
   session.stack <-
     (Stack.local_stack_object Interpreter.params).local_stack_get ();
   session.globals <-
     (Global.globals_object Interpreter.params).globals_get ();
+  session.location_state <-
+    LLVMEvents.printer_object.printer_get_loc_state ();
   session.location <-
     Camlcoq.camlstring_of_coqstring
       (LLVMEvents.printer_object.printer_get_loc ())
@@ -222,6 +229,55 @@ let report_new_locals old_stack new_stack =
 let report_introduced old_globals old_stack session =
   report_new_globals old_globals session.globals;
   report_new_locals old_stack session.stack
+
+let state_changed old_globals old_stack old_location session =
+  old_location <> session.location
+  || old_globals <> session.globals
+  || old_stack <> session.stack
+
+let next_node_is_boundary tree =
+  match ITreeDefinition.observe tree with
+  | ITreeDefinition.TauF _ -> false
+  | ITreeDefinition.RetF _ | ITreeDefinition.VisF _ -> true
+
+let step_limit = 10_000
+
+let advance side session ~single tree =
+  let old_globals = session.globals in
+  let old_stack = session.stack in
+  let old_location = session.location in
+  publish_observers session;
+  let first_node = describe_next_node session in
+  let rec advance_from count tree =
+    match Interpreter.single_step tree with
+    | Either.Right result ->
+        session.tree <- None;
+        capture_observers session;
+        if not single then Printf.printf "Advanced %d ITree transition(s).\n" (count + 1);
+        report_step first_node session;
+        report_result side result;
+        report_introduced old_globals old_stack session
+    | Either.Left next ->
+        let count = count + 1 in
+        session.tree <- Some next;
+        let boundary = next_node_is_boundary next in
+        capture_observers session;
+        let changed = state_changed old_globals old_stack old_location session in
+        let limit_reached = count >= step_limit in
+        if single || boundary || changed || limit_reached
+        then begin
+          if single then report_step first_node session
+          else begin
+            Printf.printf "Advanced %d ITree transition(s).\n" count;
+            report_step (describe_next_node session) session;
+            if limit_reached && not boundary && not changed then
+              Printf.printf "Stopped after %d transitions without a state change.\n" step_limit
+          end;
+          report_introduced old_globals old_stack session
+        end
+        else advance_from count next
+  in
+  advance_from 0 tree
 
 let print_itree session =
   let max_lines = 10 in
@@ -287,56 +343,14 @@ let rec command_loop left right focus last_command =
       print_itree session;
       capture_observers session;
       command_loop left right focus (Some PrintTree)
-  | Some Step ->
-      match focus with
-      | Left ->
-          (match left.tree with
-           | None ->
-               Printf.printf "Left program has already stopped.\n";
-               command_loop left right focus (Some Step)
-           | Some tree ->
-               let old_globals = left.globals in
-               let old_stack = left.stack in
-               publish_observers left;
-               let node = describe_next_node left in
-               match Interpreter.single_step tree with
-               | Either.Left next ->
-                   left.tree <- Some next;
-                   capture_observers left;
-                   report_step node left;
-                   report_introduced old_globals old_stack left;
-                   command_loop left right focus (Some Step)
-               | Either.Right result ->
-                   left.tree <- None;
-                   capture_observers left;
-                   report_step node left;
-                   report_result "Left" result;
-                   report_introduced old_globals old_stack left;
-                   command_loop left right focus (Some Step))
-      | Right ->
-          (match right.tree with
-           | None ->
-               Printf.printf "Right program has already stopped.\n";
-               command_loop left right focus (Some Step)
-           | Some tree ->
-               let old_globals = right.globals in
-               let old_stack = right.stack in
-               publish_observers right;
-               let node = describe_next_node right in
-               match Interpreter.single_step tree with
-               | Either.Left next ->
-                   right.tree <- Some next;
-                   capture_observers right;
-                   report_step node right;
-                   report_introduced old_globals old_stack right;
-                   command_loop left right focus (Some Step)
-               | Either.Right result ->
-                   right.tree <- None;
-                   capture_observers right;
-                   report_step node right;
-                   report_result "Right" result;
-                   report_introduced old_globals old_stack right;
-                   command_loop left right focus (Some Step))
+  | Some (Step | StepITree as command) ->
+      let side, session =
+        match focus with Left -> ("Left", left) | Right -> ("Right", right)
+      in
+      (match session.tree with
+       | None -> Printf.printf "%s program has already stopped.\n" side
+       | Some tree -> advance side session ~single:(command = StepITree) tree);
+      command_loop left right focus (Some command)
 
 (* [-skip-init], for one side: get to the code under test before the first
    prompt, instead of making the user step through the global environment twice
@@ -375,10 +389,14 @@ let interleave_itrees ~(left_skip : int option) ~(right_skip : int option) left 
     Camlcoq.camlstring_of_coqstring
       (LLVMEvents.printer_object.printer_get_loc ())
   in
+  let initial_location_state =
+    LLVMEvents.printer_object.printer_get_loc_state ()
+  in
   let left =
     { tree = Some left;
       stack = initial_stack;
       globals = initial_globals;
+      location_state = initial_location_state;
       location = initial_location;
     }
   in
@@ -386,6 +404,7 @@ let interleave_itrees ~(left_skip : int option) ~(right_skip : int option) left 
     { tree = Some right;
       stack = initial_stack;
       globals = initial_globals;
+      location_state = initial_location_state;
       location = initial_location;
     }
   in
