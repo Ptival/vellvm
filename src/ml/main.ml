@@ -218,6 +218,7 @@ let args =
        \t  arg:     ptr %in              one argument; repeatable\n\
        \t  buffer in: [2 x i32] = [i32 1, i32 2]   storage to allocate; repeatable\n\
        \t  argv:    prog --flag          argv for @main, instead of an entry\n\
+       \t  skip-init: yes                step from the entry (see -skip-init)\n\
        \t  include: common" ^ Manifest.extension ^ "        build on another manifest\n\
        \tAn indented line continues the value above it, so a long initializer can\n\
        \tbe folded. A path is relative to the file it is written in. Buffers are\n\
@@ -311,6 +312,18 @@ let args =
   ; ( "-link-right"
     , String (link_file_into link_files_right "right")
     , "link one .ll file into the right program only; may be repeated"
+    )
+
+  ; ( "-skip-init"
+    , Set Interpreter.skip_init
+    , "start stepping at the entry, not at the program's initialization\n\
+       \tGlobals are allocated and initialized before any entry is called, which\n\
+       \tis a few hundred steps of nothing to look at; this runs them, and the\n\
+       \tbuffer setup of a generated harness, before the first prompt. The entry\n\
+       \tis the one -entry names, or '@main'. Only useful with -debugger and\n\
+       \t-interleave, since without them there is nothing to step.\n\
+       \tThis asks for it on both programs; a manifest's 'skip-init: yes' asks\n\
+       \tfor it on its own, and the two add up rather than conflicting."
     )
 
   ; ( "-show-harness"
@@ -416,7 +429,12 @@ let main () =
         ~(links : TopLevel.ll_toplevel_entities list) (path : string) =
       let manifest = Manifest.load_target path in
       if not (Manifest.is_manifest path) then
-        {Interleave.label = manifest.Manifest.label; path; entry; argv = None; links}
+        { Interleave.label = manifest.Manifest.label
+        ; path
+        ; entry
+        ; argv = None
+        ; links
+        ; skip_init = false }
       else begin
         ( match flags with
         | [] -> ()
@@ -438,7 +456,8 @@ let main () =
         ; path = manifest.Manifest.program
         ; entry
         ; argv
-        ; links = List.map Manifest.ast_of_source manifest.Manifest.links }
+        ; links = List.map Manifest.ast_of_source manifest.Manifest.links
+        ; skip_init = manifest.Manifest.skip_init }
       end
     in
     if Option.is_some !interleaved_interpret then
@@ -464,19 +483,30 @@ let main () =
           let side = side_of_target ~flags:shared_flags ~entry:left_entry ~links:[] path in
           Out_channel.set_buffered stdout false ;
           Out_channel.set_buffered stderr false ;
-          let tree, entry_description =
+          let tree, entry_description, skip =
             Interleave.build_itree !command_line_args !link_files side
           in
           Printf.printf "Running %s%s\n" side.Interleave.label
             (match entry_description with
              | None -> ""
              | Some description -> Printf.sprintf ", from %s" description) ;
+          (* When asked, the program is advanced to its entry before anything else
+             happens; without -debugger that changes nothing, since the rest of the
+             run is what would have happened anyway. *)
+          let start =
+            match skip with
+            | Some frames -> Interpreter.skip_initialization ~frames tree
+            | None -> Either.Left tree
+          in
           let result =
-            if !debugger then begin
-              Interpreter.debug_flag := true ;
-              Debugger.debugger tree
-            end
-            else Interpreter.step tree
+            match start with
+            | Either.Right result -> result
+            | Either.Left tree ->
+                if !debugger then begin
+                  Interpreter.debug_flag := true ;
+                  Debugger.start ~skipped:(Option.is_some skip) tree
+                end
+                else Interpreter.step tree
           in
           ( match result with
           | Ok dv ->

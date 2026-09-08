@@ -230,6 +230,22 @@ let rec debugger
      debugger m
   | Quit -> Error (Failed "Quitting")
 
+(* Enter the debugger on a program that, when [skipped], has already been advanced
+   past its initialization. This module records the current line before anything
+   has run, so after a skip that record is stale: [step] would see it differ from
+   where we actually are and stop the first `s` on the line we are already on,
+   spending a keystroke. Adopting the location we were left at makes the first `s`
+   advance a line like every other one. *)
+let start ~(skipped : bool) m =
+  if skipped then begin
+    let location =
+      Camlcoq.camlstring_of_coqstring (LLVMEvents.printer_object.printer_get_loc ())
+    in
+    current_line := location;
+    Printf.printf "Program is at %s, past initialization.\n" location
+  end;
+  debugger m
+
 let vellvm_debugger
       (args : string list)
       (prog :
@@ -241,4 +257,7 @@ let vellvm_debugger
   Out_channel.set_buffered stdout false;
   Out_channel.set_buffered stderr false;
   let prog = (TopLevel.interpreter (List.map Camlcoq.coqstring_of_camlstring args) prog) in
-  debugger prog
+  (* This entry is always @main, so its frame is the first one pushed. *)
+  match (if !skip_init then skip_initialization ~frames:1 prog else Either.Left prog) with
+  | Either.Left prog -> start ~skipped:!skip_init prog
+  | Either.Right result -> result

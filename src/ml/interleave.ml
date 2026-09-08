@@ -14,25 +14,38 @@ type side =
     entry : Entry.spec option;
     argv : string list option;
     links : TopLevel.ll_toplevel_entities list;
+    skip_init : bool;  (* this side's own `skip-init:`; -skip-init asks for both *)
   }
 
-(* Load one side of the interleaving, returning its itree and, when an entry was
-   chosen, a description of the call it starts from. With no entry this is the
-   usual whole-program run from @main, with the side's own `argv` if it has one and
-   [-args] otherwise; either way [denote_vellvm] initializes the globals before
-   reaching the entry. *)
+(* Load one side of the interleaving, returning its itree, a description of the
+   call it starts from when an entry was chosen, and -- when this side is to be
+   advanced past its initialization -- how many stack frames deep that call sits,
+   which is what [Interpreter.skip_initialization] needs. With no entry this is
+   the usual whole-program run from @main, with the side's own `argv` if it has one
+   and [-args] otherwise; either way [denote_vellvm] initializes the globals
+   before reaching the entry. *)
 let build_itree args shared_links side =
   let ast = IO.parse_file side.path in
   let linked_ast = TopLevel.link_all (side.links @ shared_links) ast in
+  (* A manifest may ask for the skip on its own program, and [-skip-init] asks for
+     it on every program; neither contradicts the other, since this changes only
+     where stepping begins and not what the program does. *)
+  let skip frames =
+    if side.skip_init || !Interpreter.skip_init then Some frames else None
+  in
   match side.entry with
   | None ->
       let argv = Option.value side.argv ~default:args in
-      (TopLevel.interpreter (List.map Camlcoq.coqstring_of_camlstring argv) linked_ast, None)
+      ( TopLevel.interpreter (List.map Camlcoq.coqstring_of_camlstring argv) linked_ast
+      , None
+      , skip 1 )
   | Some spec ->
       (* [resolve] may link a generated harness into the program, so the itree is
          built from the program it hands back rather than from [linked_ast]. *)
       let resolved = Entry.resolve ~context:side.label linked_ast spec in
-      (Entry.interpreter resolved, Some (Entry.describe resolved))
+      ( Entry.interpreter resolved
+      , Some (Entry.describe resolved)
+      , skip resolved.Entry.frames_to_entry )
 
 type focus = Left | Right
 
@@ -325,7 +338,33 @@ let rec command_loop left right focus last_command =
                    report_introduced old_globals old_stack right;
                    command_loop left right focus (Some Step))
 
-let interleave_itrees left right =
+(* [-skip-init], for one side: get to the code under test before the first
+   prompt, instead of making the user step through the global environment twice
+   over, once per side.
+
+   This goes through the observers like every other step, and one side at a time,
+   because the stack and globals a step reads are process-wide mutable state that
+   the two sides take turns owning: skipping the left side leaves the observers
+   holding the left side's post-initialization state, which is why the right side
+   has to publish its own before it may advance. *)
+let skip_initialization side ~(frames : int) session =
+  match session.tree with
+  | None -> ()
+  | Some tree -> (
+      publish_observers session ;
+      match Interpreter.skip_initialization ~frames tree with
+      | Either.Left tree ->
+          session.tree <- Some tree ;
+          capture_observers session ;
+          Printf.printf "%s program is at %s, past initialization.\n" side
+            (show_location session.location)
+      | Either.Right result ->
+          session.tree <- None ;
+          capture_observers session ;
+          Printf.printf "%s program stopped before reaching its entry.\n" side ;
+          report_result side result )
+
+let interleave_itrees ~(left_skip : int option) ~(right_skip : int option) left right =
   let initial_stack =
     (Stack.local_stack_object Interpreter.params).local_stack_get ()
   in
@@ -336,18 +375,23 @@ let interleave_itrees left right =
     Camlcoq.camlstring_of_coqstring
       (LLVMEvents.printer_object.printer_get_loc ())
   in
-  command_loop
+  let left =
     { tree = Some left;
       stack = initial_stack;
       globals = initial_globals;
       location = initial_location;
     }
+  in
+  let right =
     { tree = Some right;
       stack = initial_stack;
       globals = initial_globals;
       location = initial_location;
     }
-    Left None
+  in
+  Option.iter (fun frames -> skip_initialization "Left" ~frames left) left_skip;
+  Option.iter (fun frames -> skip_initialization "Right" ~frames right) right_skip;
+  command_loop left right Left None
 
 (* Each side carries its own entry, buffers and link files: the two programs are
    resolved independently, so they may start from different functions with
@@ -355,8 +399,8 @@ let interleave_itrees left right =
 let interleave args shared_links left_side right_side =
   Out_channel.set_buffered stdout false;
   Out_channel.set_buffered stderr false;
-  let left, left_entry = build_itree args shared_links left_side in
-  let right, right_entry = build_itree args shared_links right_side in
+  let left, left_entry, left_skip = build_itree args shared_links left_side in
+  let right, right_entry, right_skip = build_itree args shared_links right_side in
   (* The label is the manifest's [name:] when there is one, and the basename of
      the program otherwise, in which case there is no point in printing both. *)
   let describe side entry =
@@ -370,4 +414,4 @@ let interleave args shared_links left_side right_side =
   in
   Printf.printf " Left file: %s\n" (describe left_side left_entry);
   Printf.printf "Right file: %s\n" (describe right_side right_entry);
-  interleave_itrees left right;
+  interleave_itrees ~left_skip ~right_skip left right;

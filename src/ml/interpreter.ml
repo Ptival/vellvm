@@ -49,6 +49,11 @@ let string_of_bytes (bytes : Integers.bit_int list) : bytes =
 
 let debug_flag = ref false
 
+(** Set by [-skip-init]: advance past the initialization of the global
+    environment before handing the program to the debugger or the interleaver,
+    rather than making the user step through it. *)
+let skip_init = ref false
+
 (** Print a debug message to stdout if the `debug_flag` is enabled.
 
     This is used to implement `debugE` events.
@@ -142,6 +147,58 @@ let rec step (m : (__ coq_MCFGEbot, interp_state) itree)
   match single_step m with
   | Either.Left x -> step x
   | Either.Right res -> res
+
+let stack_depth () =
+  List.length ((Stack.local_stack_object params).local_stack_get ())
+
+(** Advance to the first instruction of the function the run starts from, past
+    the global environment that [denote_vellvm] builds before the entry is ever
+    called (and past `argv`, when the run starts at @main). A handful of globals
+    is a few hundred ITree nodes, none of them the code under test, and stepping
+    through them one node at a time is what [-skip-init] is for.
+
+    "Now in the function we wanted" is read off the local stack rather than off
+    the source location, because a frame being pushed is what entering a function
+    means: the initialization runs in the frame that is already on the stack when
+    the itree is built, so the entry's own frame is the first one pushed after it.
+    [frames] is how many frames down the wanted function sits -- two rather than
+    one when a generated harness stands between the itree's entry and the
+    requested one, so that allocating and filling the buffers is skipped along
+    with the globals (see [Entry.frames_to_entry]).
+
+    Returns the program stopped at that point, or its result if it terminated
+    first, which for a well-formed program means initialization itself failed. *)
+let skip_initialization ~(frames : int) (m : (__ coq_MCFGEbot, interp_state) itree)
+    : ((__ coq_MCFGEbot, interp_state) itree,
+       (DV.dvalue, exit_condition) result) Either.t =
+  let location () =
+    Camlcoq.camlstring_of_coqstring (LLVMEvents.printer_object.printer_get_loc ())
+  in
+  let target = stack_depth () + frames in
+  (* The frame is pushed before the function's first instruction is denoted, so
+     stopping the moment [target] is reached would leave us reporting the caller's
+     `call` as the current location (or, for the entry the itree itself starts at,
+     the unknown location initialization ran under). Once the frame is there, take
+     the few further steps until the location changes: that is the first
+     instruction of the function beginning, and the position the debugger would
+     report. It cannot already be that instruction's location, since the location
+     only ever names something that has started running. *)
+  let rec enter m =
+    if stack_depth () >= target then start_of_body (location ()) m
+    else
+      match single_step m with
+      | Either.Left next -> enter next
+      | Either.Right result -> Either.Right result
+  and start_of_body caller m =
+    (* The depth check is a backstop: a body that returns without the location
+       ever changing would otherwise run the rest of the program. *)
+    if location () <> caller || stack_depth () < target then Either.Left m
+    else
+      match single_step m with
+      | Either.Left next -> start_of_body caller next
+      | Either.Right result -> Either.Right result
+  in
+  enter m
 
 (** Interpret an LLVM program, returning a result that contains either the
     dvalue result returned by the LLVM program, or an error message.
