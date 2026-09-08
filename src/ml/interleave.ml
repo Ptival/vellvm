@@ -60,6 +60,7 @@ type command =
 
 type 'tree session =
   { mutable tree : 'tree option;
+    source_path : string;
     mutable stack : Stack.stack_frame list;
     mutable globals : Global.global_env;
     mutable location_state : LLVMAst.file_info option;
@@ -242,6 +243,53 @@ let next_node_is_boundary tree =
 
 let step_limit = 10_000
 
+let source_cache = Hashtbl.create 2
+
+let source_lines path =
+  match Hashtbl.find_opt source_cache path with
+  | Some lines -> Some lines
+  | None ->
+      (match
+         try
+           Some
+             (In_channel.with_open_text path (fun channel ->
+                In_channel.input_all channel
+                |> String.split_on_char '\n'
+                |> Array.of_list))
+         with Sys_error _ -> None
+       with
+       | None -> None
+       | Some lines ->
+           Hashtbl.add source_cache path lines;
+           Some lines)
+
+let source_path_for_location source_path filename =
+  if Filename.basename source_path = Filename.basename filename then Some source_path
+  else if Sys.file_exists filename then Some filename
+  else
+    let relative_to_source = Filename.concat (Filename.dirname source_path) filename in
+    if Sys.file_exists relative_to_source then Some relative_to_source else None
+
+let print_source_location session =
+  match session.location_state with
+  | None -> ()
+  | Some (file_info : LLVMAst.file_info) ->
+      let filename = Camlcoq.camlstring_of_coqstring file_info.filename in
+      (match source_path_for_location session.source_path filename with
+       | None -> ()
+       | Some path ->
+           match source_lines path with
+           | None -> ()
+           | Some lines ->
+               let first = Camlcoq.Z.to_int file_info.start_line in
+               let last = Camlcoq.Z.to_int file_info.end_line in
+               if first >= 1 && first <= last && first <= Array.length lines then begin
+                 let last = min last (Array.length lines) in
+                 for line_number = first to last do
+                   Printf.printf "  %d | %s\n" line_number lines.(line_number - 1)
+                 done
+               end)
+
 let advance side session ~single tree =
   let old_globals = session.globals in
   let old_stack = session.stack in
@@ -270,6 +318,7 @@ let advance side session ~single tree =
           else begin
             Printf.printf "Advanced %d ITree transition(s).\n" count;
             report_step (describe_next_node session) session;
+            print_source_location session;
             if limit_reached && not boundary && not changed then
               Printf.printf "Stopped after %d transitions without a state change.\n" step_limit
           end;
@@ -378,7 +427,8 @@ let skip_initialization side ~(frames : int) session =
           Printf.printf "%s program stopped before reaching its entry.\n" side ;
           report_result side result )
 
-let interleave_itrees ~(left_skip : int option) ~(right_skip : int option) left right =
+let interleave_itrees ~(left_skip : int option) ~(right_skip : int option)
+    ~left_source ~right_source left right =
   let initial_stack =
     (Stack.local_stack_object Interpreter.params).local_stack_get ()
   in
@@ -394,6 +444,7 @@ let interleave_itrees ~(left_skip : int option) ~(right_skip : int option) left 
   in
   let left =
     { tree = Some left;
+      source_path = left_source;
       stack = initial_stack;
       globals = initial_globals;
       location_state = initial_location_state;
@@ -402,6 +453,7 @@ let interleave_itrees ~(left_skip : int option) ~(right_skip : int option) left 
   in
   let right =
     { tree = Some right;
+      source_path = right_source;
       stack = initial_stack;
       globals = initial_globals;
       location_state = initial_location_state;
@@ -433,4 +485,5 @@ let interleave args shared_links left_side right_side =
   in
   Printf.printf " Left file: %s\n" (describe left_side left_entry);
   Printf.printf "Right file: %s\n" (describe right_side right_entry);
-  interleave_itrees ~left_skip ~right_skip left right;
+  interleave_itrees ~left_skip ~right_skip
+    ~left_source:left_side.path ~right_source:right_side.path left right;
