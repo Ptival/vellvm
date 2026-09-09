@@ -438,6 +438,9 @@ let advance side session ~command tree =
   let old_location = session.location in
   publish_observers session;
   let first_node = describe_next_node session in
+  let starting_call_location =
+    if until_call && location_is_call session then Some session.location else None
+  in
   let rec advance_from count tree =
     match Interpreter.single_step tree with
     | Either.Right result ->
@@ -453,7 +456,13 @@ let advance side session ~command tree =
         let boundary = next_node_is_boundary next in
         capture_observers session;
         let changed = state_changed old_globals old_stack old_location session in
-        let reached_call = until_call && location_is_call session in
+        let reached_call =
+          until_call
+          && location_is_call session
+          && Option.fold ~none:true
+               ~some:(fun starting -> session.location <> starting)
+               starting_call_location
+        in
         let limit_reached = count >= step_limit in
         if single || boundary || reached_call || (not until_call && changed) || limit_reached
         then begin
