@@ -54,6 +54,8 @@ type command =
   | FocusRight
   | Step
   | StepITree
+  | StepCall
+  | Examine of string * int
   | PrintLocals
   | PrintGlobals
   | PrintTree
@@ -61,6 +63,7 @@ type command =
 type 'tree session =
   { mutable tree : 'tree option;
     source_path : string;
+    mutable memory : Memory0.memory;
     mutable stack : Stack.stack_frame list;
     mutable globals : Global.global_env;
     mutable location_state : LLVMAst.file_info option;
@@ -77,13 +80,23 @@ let read_command focus last_command =
   | "right" | "r" -> Some FocusRight
   | "step" | "s" -> Some Step
   | "stepi" | "si" -> Some StepITree
+  | "stepc" | "sc" -> Some StepCall
   | "pl" -> Some PrintLocals
   | "pg" -> Some PrintGlobals
   | "pt" -> Some PrintTree
-  | _ ->
-      Printf.printf
-        "Invalid command. Expected left (l), right (r), step (s), stepi (si), pl, pg, or pt.\n";
-      None
+  | input ->
+      (match Str.split (Str.regexp "[ \t]+") (String.trim input) with
+       | ["x"; local; count] ->
+           (match int_of_string_opt count with
+            | Some count when count > 0 && count <= 4096 -> Some (Examine (local, count))
+            | _ ->
+                Printf.printf "The byte count must be between 1 and 4096.\n";
+                None)
+       | _ ->
+           Printf.printf
+             "Invalid command. Expected left (l), right (r), step (s), stepi (si), \
+              stepc (sc), x <local> <bytes>, pl, pg, or pt.\n";
+           None)
 
 let report_result side = function
   | Ok value ->
@@ -168,9 +181,12 @@ let publish_stack session =
 let publish_observers session =
   publish_globals session;
   publish_stack session;
+  (Memory0.memory_object Interpreter.params).memory_set session.memory;
   ignore (LLVMEvents.printer_object.printer_set_loc session.location_state)
 
 let capture_observers session =
+  session.memory <-
+    (Memory0.memory_object Interpreter.params).memory_get ();
   session.stack <-
     (Stack.local_stack_object Interpreter.params).local_stack_get ();
   session.globals <-
@@ -231,6 +247,63 @@ let report_introduced old_globals old_stack session =
   report_new_globals old_globals session.globals;
   report_new_locals old_stack session.stack
 
+let normalize_local_name name =
+  let name = String.trim name in
+  if String.length name > 0 && name.[0] = '%' then String.sub name 1 (String.length name - 1)
+  else name
+
+let find_local name stack =
+  let name = normalize_local_name name in
+  let identifier =
+    match int_of_string_opt name with
+    | Some number when number >= 0 -> LLVMAst.Anon (Camlcoq.Z.of_sint number)
+    | _ -> LLVMAst.Name (Camlcoq.coqstring_of_camlstring name)
+  in
+  let rec find = function
+    | [] -> None
+    | (frame : Stack.stack_frame) :: frames ->
+        (match RawIdMaps.RM.find identifier frame.stack_vars with
+         | Some value -> Some value
+         | None -> find frames)
+  in
+  find stack
+
+let byte_string memory pointer offset =
+  let params = Interpreter.params in
+  let address =
+    BinInt.Z.add (params.coq_P2I.ptr_to_int pointer) (Camlcoq.Z.of_sint offset)
+  in
+  match Memory0.read_byte_raw_mem params memory address with
+  | None -> "--"
+  | Some (byte, allocation_id) ->
+      if not (params.coq_PROV.access_allowed (params.coq_PTR.ptr_provenance pointer) allocation_id)
+      then "!!"
+      else
+        match MemoryBytes.memory_byte_value params byte with
+        | EOU.Coq_raise_ret (MemoryBytes.NoPois value) ->
+            Printf.sprintf "%02x" (Camlcoq.Z.to_int value land 0xff)
+        | EOU.Coq_raise_ret MemoryBytes.Pois -> "pp"
+        | EOU.Coq_raise_error _ | EOU.Coq_raise_oom _ | EOU.Coq_raise_ub _ -> "??"
+
+let examine_memory session local count =
+  match find_local local session.stack with
+  | None -> Printf.printf "No local named %%%s is in scope.\n" (normalize_local_name local)
+  | Some (DynamicValues.DVALUE_Base (DynamicValues.DVALUE_Pointer pointer)) ->
+      let base = Interpreter.params.coq_P2I.ptr_to_int pointer in
+      for row = 0 to (count - 1) / 16 do
+        let offset = row * 16 in
+        let width = min 16 (count - offset) in
+        let address = BinInt.Z.add base (Camlcoq.Z.of_sint offset) in
+        let bytes =
+          List.init width (fun index -> byte_string session.memory pointer (offset + index))
+        in
+        Printf.printf "%s: %s\n" (Camlcoq.Z.to_string address) (String.concat " " bytes)
+      done;
+      Printf.printf "(-- unallocated, !! invalid provenance, pp poison, ?? symbolic)\n"
+  | Some value ->
+      Printf.printf "%s is not a pointer (it is %s).\n" local
+        (Interpreter.string_of_dvalue value)
+
 let state_changed old_globals old_stack old_location session =
   old_location <> session.location
   || old_globals <> session.globals
@@ -270,27 +343,47 @@ let source_path_for_location source_path filename =
     let relative_to_source = Filename.concat (Filename.dirname source_path) filename in
     if Sys.file_exists relative_to_source then Some relative_to_source else None
 
-let print_source_location session =
+let source_location_lines session =
   match session.location_state with
-  | None -> ()
+  | None -> []
   | Some (file_info : LLVMAst.file_info) ->
       let filename = Camlcoq.camlstring_of_coqstring file_info.filename in
       (match source_path_for_location session.source_path filename with
-       | None -> ()
+       | None -> []
        | Some path ->
            match source_lines path with
-           | None -> ()
+           | None -> []
            | Some lines ->
                let first = Camlcoq.Z.to_int file_info.start_line in
                let last = Camlcoq.Z.to_int file_info.end_line in
-               if first >= 1 && first <= last && first <= Array.length lines then begin
+               if first >= 1 && first <= last && first <= Array.length lines then
                  let last = min last (Array.length lines) in
-                 for line_number = first to last do
-                   Printf.printf "  %d | %s\n" line_number lines.(line_number - 1)
-                 done
-               end)
+                 List.init (last - first + 1)
+                   (fun offset ->
+                     let line_number = first + offset in
+                     (line_number, lines.(line_number - 1)))
+               else [])
 
-let advance side session ~single tree =
+let print_source_location session =
+  List.iter
+    (fun (line_number, line) -> Printf.printf "  %d | %s\n" line_number line)
+    (source_location_lines session)
+
+let line_has_call_opcode line =
+  let instruction =
+    match String.index_opt line ';' with
+    | None -> line
+    | Some comment -> String.sub line 0 comment
+  in
+  Str.split (Str.regexp "[ \t]+") (String.trim instruction)
+  |> List.exists (String.equal "call")
+
+let location_is_call session =
+  List.exists (fun (_, line) -> line_has_call_opcode line) (source_location_lines session)
+
+let advance side session ~command tree =
+  let single = command = StepITree in
+  let until_call = command = StepCall in
   let old_globals = session.globals in
   let old_stack = session.stack in
   let old_location = session.location in
@@ -311,16 +404,19 @@ let advance side session ~single tree =
         let boundary = next_node_is_boundary next in
         capture_observers session;
         let changed = state_changed old_globals old_stack old_location session in
+        let reached_call = until_call && location_is_call session in
         let limit_reached = count >= step_limit in
-        if single || boundary || changed || limit_reached
+        if single || boundary || reached_call || (not until_call && changed) || limit_reached
         then begin
           if single then report_step first_node session
           else begin
             Printf.printf "Advanced %d ITree transition(s).\n" count;
             report_step (describe_next_node session) session;
             print_source_location session;
-            if limit_reached && not boundary && not changed then
-              Printf.printf "Stopped after %d transitions without a state change.\n" step_limit
+            if limit_reached && not boundary && not reached_call then
+              Printf.printf
+                "Stopped after %d transitions without reaching the requested boundary.\n"
+                step_limit
           end;
           report_introduced old_globals old_stack session
         end
@@ -392,13 +488,17 @@ let rec command_loop left right focus last_command =
       print_itree session;
       capture_observers session;
       command_loop left right focus (Some PrintTree)
-  | Some (Step | StepITree as command) ->
+  | Some (Examine (local, count) as command) ->
+      let session = match focus with Left -> left | Right -> right in
+      examine_memory session local count;
+      command_loop left right focus (Some command)
+  | Some (Step | StepITree | StepCall as command) ->
       let side, session =
         match focus with Left -> ("Left", left) | Right -> ("Right", right)
       in
       (match session.tree with
        | None -> Printf.printf "%s program has already stopped.\n" side
-       | Some tree -> advance side session ~single:(command = StepITree) tree);
+       | Some tree -> advance side session ~command tree);
       command_loop left right focus (Some command)
 
 (* [-skip-init], for one side: get to the code under test before the first
@@ -406,10 +506,10 @@ let rec command_loop left right focus last_command =
    over, once per side.
 
    This goes through the observers like every other step, and one side at a time,
-   because the stack and globals a step reads are process-wide mutable state that
-   the two sides take turns owning: skipping the left side leaves the observers
-   holding the left side's post-initialization state, which is why the right side
-   has to publish its own before it may advance. *)
+   because the debugger observers are process-wide mutable state that the two
+   sides take turns owning: skipping the left side leaves the observers holding
+   the left side's post-initialization state, which is why the right side has to
+   publish its own before it may advance. *)
 let skip_initialization side ~(frames : int) session =
   match session.tree with
   | None -> ()
@@ -442,9 +542,13 @@ let interleave_itrees ~(left_skip : int option) ~(right_skip : int option)
   let initial_location_state =
     LLVMEvents.printer_object.printer_get_loc_state ()
   in
+  let initial_memory =
+    (Memory0.memory_object Interpreter.params).memory_get ()
+  in
   let left =
     { tree = Some left;
       source_path = left_source;
+      memory = initial_memory;
       stack = initial_stack;
       globals = initial_globals;
       location_state = initial_location_state;
@@ -454,6 +558,7 @@ let interleave_itrees ~(left_skip : int option) ~(right_skip : int option)
   let right =
     { tree = Some right;
       source_path = right_source;
+      memory = initial_memory;
       stack = initial_stack;
       globals = initial_globals;
       location_state = initial_location_state;

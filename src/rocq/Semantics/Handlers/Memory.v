@@ -65,7 +65,10 @@ Section withParams.
               | Mub s => raiseUB s
               | Merr s => raise s
               | Mget   k => memM_interp (k σ) σ
-              | Mput σ' k => memM_interp (k tt) σ'
+              | Mput σ' k =>
+                  _ <- ret (memory_object.(memory_set)
+                         σ'.(state_memory_stack).(Memory_stack_memory));;
+                  memM_interp (k tt) σ'
               | Mchoose (Cnext_key _ align) k =>
                   memM_interp
                     (k (next_key_with_alignment σ.(state_memory_stack).(Memory_stack_memory) align))

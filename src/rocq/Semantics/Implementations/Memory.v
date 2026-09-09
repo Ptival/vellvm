@@ -335,6 +335,17 @@ Section Implementation.
       }.
 
   Definition memory_empty : memory := IntMaps.empty.
+
+  (* Extraction replaces this pure object with a ref-cell so the interactive
+     debugger can inspect the current memory without changing the semantics. *)
+  Record debug_memory := mk_debug_memory {
+      memory_set : memory -> unit;
+      memory_get : unit -> memory;
+    }.
+
+  Definition memory_object : debug_memory :=
+    mk_debug_memory (fun (_ : memory) => tt) (fun (_ : unit) => memory_empty).
+
   Definition frame_empty : Framestack := Singleton [].
   Definition heap_empty : Heap := IntMaps.empty.
   Definition empty_memory_stack : Memory_stack :=
@@ -609,5 +620,4 @@ Section Implementation.
     |}.
   
 End Implementation.
-
 

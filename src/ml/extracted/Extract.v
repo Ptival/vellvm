@@ -103,6 +103,15 @@ Extract Constant local_stack_object => "
   }
   ".
 
+Extract Constant Vellvm.Semantics.Implementations.Memory.memory_object => "
+  let memory_ref = ref IntMaps.IM.empty in
+  let memory_set memory = (memory_ref := memory; ()) in
+  let memory_get = fun _ -> !memory_ref in
+  fun _ -> { memory_set;
+    memory_get;
+  }
+  ".
+
 (* OCaml pervasive types ---------------------------------------------------- *)
 (* Extract Inlined Constant LLVMAst.int => "int". *)
 (* Extract Inlined Constant LLVMAst.float => "float". *)
