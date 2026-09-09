@@ -49,13 +49,15 @@ let build_itree args shared_links side =
 
 type focus = Left | Right
 
+type examine_format = Bytes | Int32s
+
 type command =
   | FocusLeft
   | FocusRight
   | Step
   | StepITree
   | StepCall
-  | Examine of string * int
+  | Examine of examine_format * string * int
   | PrintLocals
   | PrintGlobals
   | PrintTree
@@ -86,16 +88,24 @@ let read_command focus last_command =
   | "pt" -> Some PrintTree
   | input ->
       (match Str.split (Str.regexp "[ \t]+") (String.trim input) with
-       | ["x"; local; count] ->
+       | [("x" | "xb"); local; count] ->
            (match int_of_string_opt count with
-            | Some count when count > 0 && count <= 4096 -> Some (Examine (local, count))
+            | Some count when count > 0 && count <= 4096 ->
+                Some (Examine (Bytes, local, count))
             | _ ->
                 Printf.printf "The byte count must be between 1 and 4096.\n";
+                None)
+       | ["xi"; local; count] ->
+           (match int_of_string_opt count with
+            | Some count when count > 0 && count <= 1024 ->
+                Some (Examine (Int32s, local, count))
+            | _ ->
+                Printf.printf "The i32 count must be between 1 and 1024.\n";
                 None)
        | _ ->
            Printf.printf
              "Invalid command. Expected left (l), right (r), step (s), stepi (si), \
-              stepc (sc), x <local> <bytes>, pl, pg, or pt.\n";
+              stepc (sc), xb <local> <bytes>, xi <local> <i32s>, pl, pg, or pt.\n";
            None)
 
 let report_result side = function
@@ -268,37 +278,76 @@ let find_local name stack =
   in
   find stack
 
-let byte_string memory pointer offset =
+type examined_byte =
+  | ConcreteByte of int
+  | UnallocatedByte
+  | InvalidProvenance
+  | PoisonByte
+  | SymbolicByte
+
+let examine_byte memory pointer offset =
   let params = Interpreter.params in
   let address =
     BinInt.Z.add (params.coq_P2I.ptr_to_int pointer) (Camlcoq.Z.of_sint offset)
   in
   match Memory0.read_byte_raw_mem params memory address with
-  | None -> "--"
+  | None -> UnallocatedByte
   | Some (byte, allocation_id) ->
       if not (params.coq_PROV.access_allowed (params.coq_PTR.ptr_provenance pointer) allocation_id)
-      then "!!"
+      then InvalidProvenance
       else
         match MemoryBytes.memory_byte_value params byte with
         | EOU.Coq_raise_ret (MemoryBytes.NoPois value) ->
-            Printf.sprintf "%02x" (Camlcoq.Z.to_int value land 0xff)
-        | EOU.Coq_raise_ret MemoryBytes.Pois -> "pp"
-        | EOU.Coq_raise_error _ | EOU.Coq_raise_oom _ | EOU.Coq_raise_ub _ -> "??"
+            ConcreteByte (Camlcoq.Z.to_int value land 0xff)
+        | EOU.Coq_raise_ret MemoryBytes.Pois -> PoisonByte
+        | EOU.Coq_raise_error _ | EOU.Coq_raise_oom _ | EOU.Coq_raise_ub _ -> SymbolicByte
 
-let examine_memory session local count =
+let byte_string = function
+  | ConcreteByte byte -> Printf.sprintf "%02x" byte
+  | UnallocatedByte -> "--"
+  | InvalidProvenance -> "!!"
+  | PoisonByte -> "pp"
+  | SymbolicByte -> "??"
+
+let int32_string bytes =
+  match bytes with
+  | [ConcreteByte b0; ConcreteByte b1; ConcreteByte b2; ConcreteByte b3] ->
+      let open Int32 in
+      let value =
+        logor (of_int b0)
+          (logor (shift_left (of_int b1) 8)
+             (logor (shift_left (of_int b2) 16) (shift_left (of_int b3) 24)))
+      in
+      to_string value
+  | bytes when List.exists (function InvalidProvenance -> true | _ -> false) bytes -> "!!"
+  | bytes when List.exists (function PoisonByte -> true | _ -> false) bytes -> "pp"
+  | bytes when List.exists (function UnallocatedByte -> true | _ -> false) bytes -> "--"
+  | _ -> "??"
+
+let print_memory_rows pointer ~count ~item_size ~items_per_row show_item =
+  let base = Interpreter.params.coq_P2I.ptr_to_int pointer in
+  for row = 0 to (count - 1) / items_per_row do
+    let first_item = row * items_per_row in
+    let width = min items_per_row (count - first_item) in
+    let byte_offset = first_item * item_size in
+    let address = BinInt.Z.add base (Camlcoq.Z.of_sint byte_offset) in
+    let items = List.init width (fun index -> show_item (first_item + index)) in
+    Printf.printf "%s: %s\n" (Camlcoq.Z.to_string address) (String.concat " " items)
+  done
+
+let examine_memory session format local count =
   match find_local local session.stack with
   | None -> Printf.printf "No local named %%%s is in scope.\n" (normalize_local_name local)
   | Some (DynamicValues.DVALUE_Base (DynamicValues.DVALUE_Pointer pointer)) ->
-      let base = Interpreter.params.coq_P2I.ptr_to_int pointer in
-      for row = 0 to (count - 1) / 16 do
-        let offset = row * 16 in
-        let width = min 16 (count - offset) in
-        let address = BinInt.Z.add base (Camlcoq.Z.of_sint offset) in
-        let bytes =
-          List.init width (fun index -> byte_string session.memory pointer (offset + index))
-        in
-        Printf.printf "%s: %s\n" (Camlcoq.Z.to_string address) (String.concat " " bytes)
-      done;
+      (match format with
+       | Bytes ->
+           print_memory_rows pointer ~count ~item_size:1 ~items_per_row:16
+             (fun offset -> examine_byte session.memory pointer offset |> byte_string)
+       | Int32s ->
+           print_memory_rows pointer ~count ~item_size:4 ~items_per_row:4
+             (fun item ->
+               List.init 4 (fun byte -> examine_byte session.memory pointer ((item * 4) + byte))
+               |> int32_string));
       Printf.printf "(-- unallocated, !! invalid provenance, pp poison, ?? symbolic)\n"
   | Some value ->
       Printf.printf "%s is not a pointer (it is %s).\n" local
@@ -488,9 +537,9 @@ let rec command_loop left right focus last_command =
       print_itree session;
       capture_observers session;
       command_loop left right focus (Some PrintTree)
-  | Some (Examine (local, count) as command) ->
+  | Some (Examine (format, local, count) as command) ->
       let session = match focus with Left -> left | Right -> right in
-      examine_memory session local count;
+      examine_memory session format local count;
       command_loop left right focus (Some command)
   | Some (Step | StepITree | StepCall as command) ->
       let side, session =
