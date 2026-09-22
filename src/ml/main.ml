@@ -204,12 +204,17 @@ let args =
 
   ; ( "-run"
     , String (fun path -> run_target := Some path)
-    , "run one program as a " ^ Manifest.extension ^ " manifest describes it\n\
+    , "run one program, or an interleaved pair, as a "
+      ^ Manifest.extension
+      ^ " manifest describes it\n\
        \t(with -debugger, debug it instead). A manifest is a line-oriented file\n\
        \tholding what the -entry/-entry-args/-entry-buffer/-link-* flags hold:\n\
        \t  ; comments start with ';' or '#'\n\
        \t  name:    rust                 label for this program in the output\n\
        \t  program: rewrite.ll           the .ll to run, relative to this file\n\
+       \tOr use a pair manifest to set up an interleaved run:\n\
+       \t  left:  original.vellvm        left .ll file or manifest\n\
+       \t  right: rewrite.vellvm         right .ll file or manifest\n\
        \t  link:    support/shims.ll     .ll to link in; repeatable\n\
        \t  harness: <<LL                 LLVM to link in, up to a line reading LL\n\
        \t    define i32 @go() { ... }\n\
@@ -390,11 +395,20 @@ let main () =
       failwith
         "-entry (and -entry-left/-entry-right) is currently only supported by -interleave \
          and -run" ;
-    if (!link_files_left <> [] || !link_files_right <> [])
-       && not (Option.is_some !interleaved_interpret)
-    then failwith "-link-left and -link-right are only supported by -interleave" ;
     if Option.is_some !interleaved_interpret && Option.is_some !run_target then
-      failwith "-run runs one program; use -interleave for two" ;
+      failwith "-run and -interleave cannot be given together" ;
+    let manifest_interleave =
+      match !run_target with
+      | Some path -> Manifest.interleaved_targets path
+      | None -> None
+    in
+    let is_interleaved =
+      Option.is_some !interleaved_interpret || Option.is_some manifest_interleave
+    in
+    if (!link_files_left <> [] || !link_files_right <> []) && not is_interleaved
+    then
+      failwith
+        "-link-left and -link-right require -interleave or a left:/right: manifest" ;
     (* Which flags were given, so that a conflict with a manifest can name all of
        them at once. Nothing layers here: a manifest describes a whole run, so a
        flag that describes part of one again is a contradiction rather than an
@@ -462,6 +476,15 @@ let main () =
     in
     if Option.is_some !interleaved_interpret then
       match !interleaved_interpret with
+      | Some (left, right) ->
+          Interleave.interleave !command_line_args !link_files
+            (side_of_target ~flags:(shared_flags @ left_flags) ~entry:left_entry
+               ~links:(List.rev !link_files_left) left)
+            (side_of_target ~flags:(shared_flags @ right_flags) ~entry:right_entry
+               ~links:(List.rev !link_files_right) right)
+      | None -> assert false
+    else if Option.is_some manifest_interleave then
+      match manifest_interleave with
       | Some (left, right) ->
           Interleave.interleave !command_line_args !link_files
             (side_of_target ~flags:(shared_flags @ left_flags) ~entry:left_entry

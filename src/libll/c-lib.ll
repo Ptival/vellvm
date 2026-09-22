@@ -1,3 +1,8 @@
+define i32 @bcmp(ptr nocapture %a, ptr nocapture %b, i64 %c) local_unnamed_addr {
+  %res = call i32 @memcmp(ptr %a, ptr %b, i64 %c)
+  ret i32 %res
+}
+
 ; Function Attrs: nofree norecurse nosync nounwind sspstrong memory(argmem: read) uwtable
 define i64 @strlen(ptr nocapture noundef readonly %0) local_unnamed_addr #0 {
   br label %2

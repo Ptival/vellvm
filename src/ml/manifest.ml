@@ -4,7 +4,7 @@
 
 (** Run manifests.
 
-    A [.vellvm] file describes one run of one LLVM program: the program, the
+    A [.vellvm] file usually describes one run of one LLVM program: the program, the
     files linked into it, and either the `argv` to give @main or the entry to call
     instead, with its arguments and the memory to allocate for them. It holds
     exactly what the [-entry]/[-entry-args]/[-entry-buffer]/[-link-*] flags hold,
@@ -25,6 +25,14 @@
       buffer out: %node = { i32 0, ptr null }
     v}
 
+    A manifest may instead describe an interleaved run by naming its two run
+    targets. Each target may itself be a manifest or a bare LLVM file:
+
+    {v
+      left:  original.vellvm
+      right: rewrite.vellvm
+    v}
+
     The format is line-oriented, [key: value], because every interesting value
     here is LLVM source text: an initializer such as [c"hi\00"] or
     [%node { i32 3, ptr @target }] would have to be escaped in a format that
@@ -41,7 +49,8 @@
     - [key: <<TAG] instead takes every following line up to a line reading [TAG]
       as the value, verbatim, newlines included. That is how [harness:] carries a
       whole function.
-    - [name:], [program:] and [entry:] may be given once. [link:], [harness:],
+    - [name:], [program:], [left:], [right:] and [entry:] may be given once.
+      [link:], [harness:],
       [arg:], [argv:], [buffer:] and [include:] accumulate, in the order written:
       buffers are allocated in that order, and arguments are passed in it.
     - Paths are relative to the file the line is written in, so a manifest and
@@ -55,7 +64,9 @@
 
     {v
       name:      the label used for this side in the driver's own output
-      program:   the .ll under test                       (required)
+      program:   the .ll under test                       (unless left:/right:)
+      left:      left target of an interleaved run         (with right:)
+      right:     right target of an interleaved run        (with left:)
       link:      one .ll linked into it, repeatable       -link-left/-link-right
       harness:   LLVM source linked into it, repeatable   (usually a heredoc)
       entry:     the function to start from               -entry
@@ -123,7 +134,7 @@ let fail (o : origin) fmt =
 type entry = {key: string; arg: string option; value: string; value_line: int; origin: origin}
 
 (* Keys that may be given once, and keys that accumulate. *)
-let scalar_keys = ["entry"; "name"; "program"; "skip-init"]
+let scalar_keys = ["entry"; "left"; "name"; "program"; "right"; "skip-init"]
 
 let list_keys = ["arg"; "argv"; "buffer"; "harness"; "include"; "link"]
 
@@ -311,6 +322,10 @@ let build ~(path : string) (entries : entry list) : t =
       match e.key with
       | "name" -> set_scalar name e
       | "program" -> set_scalar program e
+      | "left" | "right" ->
+          fail e.origin
+            "'%s:' describes an interleaved run and cannot be used as one program"
+            e.key
       | "entry" -> set_scalar entry_name e
       | "skip-init" -> set_scalar skip_init e
       | "link" -> links := Ll_file (resolve_file ~origin:e.origin e.value) :: !links
@@ -390,6 +405,37 @@ let build ~(path : string) (entries : entry list) : t =
   {label; program; links = List.rev !links; run; skip_init}
 
 let load (path : string) : t = build ~path (read_entries ~stack:[] ~depth:0 path)
+
+(** If [path] is a pair manifest, return its left and right run targets. A pair
+    manifest is deliberately only a pairing operation: the manifests it names
+    describe their respective entries, links and memory. *)
+let interleaved_targets (path : string) : (string * string) option =
+  if not (Filename.check_suffix path extension) then None
+  else
+    let entries = read_entries ~stack:[] ~depth:0 path in
+    let left = ref None and right = ref None in
+    List.iter
+      (fun (e : entry) ->
+        match e.key with
+        | "left" -> set_scalar left e
+        | "right" -> set_scalar right e
+        | _ -> ())
+      entries ;
+    match (!left, !right) with
+    | None, None -> None
+    | Some (_, origin), None -> fail origin "'left:' requires a matching 'right:'"
+    | None, Some (_, origin) -> fail origin "'right:' requires a matching 'left:'"
+    | Some (left, left_origin), Some (right, right_origin) ->
+        List.iter
+          (fun (e : entry) ->
+            if e.key <> "left" && e.key <> "right" then
+              fail e.origin
+                "'%s:' cannot appear beside 'left:' and 'right:'; put it in the side manifests"
+                e.key)
+          entries ;
+        Some
+          ( resolve_file ~origin:left_origin left
+          , resolve_file ~origin:right_origin right )
 
 (** A run target as named on the command line: a manifest, or a bare [.ll] file,
     which means the manifest [program: <that file>] and nothing else. *)

@@ -1208,3 +1208,299 @@ define { i8, i1 } @llvm.uadd.with.overflow.i8(i8 noundef %0, i8 noundef %1) loca
 define ptr @llvm.stacksave.p0() {
   ret ptr null
 }
+
+define void @llvm.experimental.noalias.scope.decl(metadata) {
+  ret void
+}
+
+define i32 @llvm.umin.i32(i32 %a, i32 %b) {
+entry:
+  %cmp = icmp ult i32 %a, %b
+  %min = select i1 %cmp, i32 %a, i32 %b
+  ret i32 %min
+}
+
+define i64 @llvm.umin.i64(i64 %a, i64 %b) {
+entry:
+  %cmp = icmp ult i64 %a, %b
+  %min = select i1 %cmp, i64 %a, i64 %b
+  ret i64 %min
+}
+
+; WARNING: LLM-generated, small Taylor expansion
+define float @llvm.exp.f32(float %x) nounwind {
+entry:
+  ; NaN returns NaN.
+  %isnan = fcmp uno float %x, %x
+  br i1 %isnan, label %ret_nan, label %check_hi
+
+ret_nan:
+  ret float %x
+
+check_hi:
+  ; expf overflows near 88.72.
+  %too_hi = fcmp ogt float %x, 8.87228390e+01
+  br i1 %too_hi, label %overflow, label %check_lo
+
+overflow:
+  ; +infinity, bit pattern 0x7f800000.
+  %inf = bitcast i32 2139095040 to float
+  ret float %inf
+
+check_lo:
+  ; This simplified implementation flushes very small results to zero.
+  %too_lo = fcmp olt float %x, -8.73365440e+01
+  br i1 %too_lo, label %underflow, label %body
+
+underflow:
+  ret float 0.000000e+00
+
+body:
+  ; Compute n = round(x / ln(2)) = round(x * log2(e)).
+  %y = fmul float %x, 1.44269502e+00
+  %y_neg = fcmp olt float %y, 0.000000e+00
+  %bias = select i1 %y_neg, float -5.000000e-01, float 5.000000e-01
+  %yb = fadd float %y, %bias
+  %n = fptosi float %yb to i32
+  %nf = sitofp i32 %n to float
+
+  ; r = x - n * ln(2), split into hi/lo pieces.
+  %n_ln2_hi = fmul float %nf, 6.93359375e-01
+  %r1 = fsub float %x, %n_ln2_hi
+  %n_ln2_lo = fmul float %nf, -2.12194440e-04
+  %r = fsub float %r1, %n_ln2_lo
+
+  ; Approximate exp(r) with:
+  ; 1 + r + r^2/2 + r^3/6 + r^4/24 + r^5/120
+  %p0 = fmul float 8.33333377e-03, %r
+  %p1 = fadd float %p0, 4.16666679e-02
+  %p2 = fmul float %p1, %r
+  %p3 = fadd float %p2, 1.66666672e-01
+  %p4 = fmul float %p3, %r
+  %p5 = fadd float %p4, 5.00000000e-01
+  %p6 = fmul float %p5, %r
+  %p7 = fadd float %p6, 1.00000000e+00
+  %p8 = fmul float %p7, %r
+  %poly = fadd float %p8, 1.00000000e+00
+
+  ; Construct 2^n by building a float exponent.
+  %exp_bits_unshifted = add i32 %n, 127
+  %exp_bits = shl i32 %exp_bits_unshifted, 23
+  %scale = bitcast i32 %exp_bits to float
+
+  ; exp(x) ~= exp(r) * 2^n
+  %result = fmul float %poly, %scale
+  ret float %result
+}
+
+define <4 x float> @llvm.exp.v4f32(<4 x float> %val) {
+entry:
+  %lane0 = extractelement <4 x float> %val, i32 0
+  %lane1 = extractelement <4 x float> %val, i32 1
+  %lane2 = extractelement <4 x float> %val, i32 2
+  %lane3 = extractelement <4 x float> %val, i32 3
+
+  %res0 = call float @llvm.exp.f32(float %lane0)
+  %res1 = call float @llvm.exp.f32(float %lane1)
+  %res2 = call float @llvm.exp.f32(float %lane2)
+  %res3 = call float @llvm.exp.f32(float %lane3)
+
+  %vec0 = insertelement <4 x float> poison, float %res0, i32 0
+  %vec1 = insertelement <4 x float> %vec0,   float %res1, i32 1
+  %vec2 = insertelement <4 x float> %vec1,   float %res2, i32 2
+  %vec3 = insertelement <4 x float> %vec2,   float %res3, i32 3
+
+  ret <4 x float> %vec3
+}
+
+; WARNING: LLM-generated
+define <4 x i8> @llvm.fptoui.sat.v4i8.v4f32(<4 x float> %val) {
+entry:
+    ; 1. Check for NaN values
+    ; ordered comparison checks if numbers are actual floats (not NaN)
+    ; %is_not_nan is true if the element is a valid number
+    %is_not_nan = fcmp ord <4 x float> %val, %val
+
+    ; 2. Handle the upper bound constraint (val > 255.0)
+    ; %is_gt_max is true if the float is strictly greater than 255.0
+    %is_gt_max = fcmp ogt <4 x float> %val, <float 255.0, float 255.0, float 255.0, float 255.0>
+    
+    ; Clamping to 255.0 if it exceeds the limit, otherwise keep original value
+    %clamp_max = select <4 x i1> %is_gt_max, <4 x float> <float 255.0, float 255.0, float 255.0, float 255.0>, <4 x float> %val
+
+    ; 3. Handle the lower bound constraint (val < 0.0)
+    ; %is_lt_zero is true if the float is strictly less than 0.0
+    %is_lt_zero = fcmp olt <4 x float> %clamp_max, zeroinitializer
+    
+    ; Clamping to 0.0 if it is negative, otherwise keep the max-clamped value
+    %clamp_min = select <4 x i1> %is_lt_zero, <4 x float> zeroinitializer, <4 x float> %clamp_max
+
+    ; 4. Handle NaN fallback
+    ; If the original value was NaN, force the float value to 0.0
+    %final_float = select <4 x i1> %is_not_nan, <4 x float> %clamp_min, <4 x float> zeroinitializer
+
+    ; 5. Safe truncation to the final integer type
+    ; Now that values are strictly between 0.0 and 255.0, fptoui is safe from undefined behavior
+    %result = fptoui <4 x float> %final_float to <4 x i8>
+    
+    ret <4 x i8> %result
+}
+
+; WARNING: LLM-generated
+define i32 @llvm.fshl.i32(i32 %a, i32 %b, i32 %shift) {
+entry:
+    ; 1. Calculate modulo 32 of the shift amount.
+    ; This prevents shift amounts >= 32 from causing undefined behavior.
+    %mod_shift = urem i32 %shift, 32
+
+    ; 2. Shift the high bits (%a) left.
+    ; This moves the required bits to the top of the result.
+    %shift_a = shl i32 %a, %mod_shift
+
+    ; 3. Calculate the complementary right shift amount for the low bits (%b).
+    ; Formula: (32 - (shift % 32)) % 32
+    %sub = sub i32 32, %mod_shift
+    %comp_shift = urem i32 %sub, 32
+
+    ; 4. Shift the low bits (%b) right.
+    ; This aligns the lower bits to merge with the shifted high bits.
+    %shift_b = lshr i32 %b, %comp_shift
+
+    ; 5. Check if the effective shift amount is exactly zero.
+    %is_zero = icmp eq i32 %mod_shift, 0
+
+    ; 6. Combine the two shifted components using bitwise OR.
+    ; This handles any non-zero shift amounts.
+    %combined = or i32 %shift_a, %shift_b
+
+    ; 7. Select between %a (if shift is 0) and the combined value.
+    ; This protects against standard right shift by 32 being undefined in IR.
+    %result = select i1 %is_zero, i32 %a, i32 %combined
+
+    ret i32 %result
+}
+
+; This was LLM-generated, but was exhaustively tested.
+define float @llvm.sqrt.f32(float %x) {
+entry:
+  %is_nan = fcmp uno float %x, %x
+  br i1 %is_nan, label %silence_nan, label %chk1
+
+chk1:
+  %is_neg = fcmp olt float %x, 0.000000e+00
+  br i1 %is_neg, label %ret_nan, label %chk2
+
+chk2:
+  ; covers +0.0, -0.0 (sign preserved via ret_x), and +inf
+  %is_zero = fcmp oeq float %x, 0.000000e+00
+  %is_inf  = fcmp oeq float %x, 0x7FF0000000000000
+  %trivial = or i1 %is_zero, %is_inf
+  br i1 %trivial, label %ret_x, label %compute
+
+compute:
+  ; The fast-inverse-sqrt bit trick assumes a *normalized* float (implicit
+  ; leading 1 + biased exponent). Subnormals have exponent field 0 and no
+  ; implicit 1, so the magic-constant seed is wildly wrong and Newton-Raphson
+  ; overflows to +inf. Fix: if x is subnormal (x < 2^-126, the smallest
+  ; normal), scale it up into the normalized range by 2^96, run the algorithm,
+  ; then scale the result back down by 2^48 since sqrt(x*2^96) = sqrt(x)*2^48.
+  %smallest_normal = bitcast i32 8388608 to float      ; 0x00800000 = 2^-126
+  %is_sub    = fcmp olt float %x, %smallest_normal
+  %scale_up_c   = bitcast i32 1870659584 to float      ; 0x6F800000 = 2^96
+  %scale_down_c = bitcast i32 662700032 to float       ; 0x27800000 = 2^-48
+  %scale_up   = select i1 %is_sub, float %scale_up_c,   float 1.000000e+00
+  %scale_down = select i1 %is_sub, float %scale_down_c, float 1.000000e+00
+  %xs = fmul float %x, %scale_up
+
+  ; initial guess for 1/sqrt(xs): i = 0x5f3759df - (bits(xs) >> 1)
+  %ibits  = bitcast float %xs to i32
+  %ishift = lshr i32 %ibits, 1
+  %iguess = sub i32 1597463007, %ishift        ; 0x5f3759df
+  %y0     = bitcast i32 %iguess to float
+
+  %half = fmul float %xs, 5.000000e-01
+
+  ; Newton-Raphson on rsqrt, x3
+  %y0sq  = fmul float %y0, %y0
+  %t0    = fmul float %half, %y0sq
+  %c0    = fsub float 1.500000e+00, %t0
+  %y1    = fmul float %y0, %c0
+
+  %y1sq  = fmul float %y1, %y1
+  %t1    = fmul float %half, %y1sq
+  %c1    = fsub float 1.500000e+00, %t1
+  %y2    = fmul float %y1, %c1
+
+  %y2sq  = fmul float %y2, %y2
+  %t2    = fmul float %half, %y2sq
+  %c2    = fsub float 1.500000e+00, %t2
+  %y3    = fmul float %y2, %c2
+
+  ; sqrt(xs) = xs * rsqrt(xs)
+  %r0 = fmul float %xs, %y3
+
+  ; one Newton step directly on sqrt to shave off remaining error
+  %r0d   = fdiv float %xs, %r0
+  %rsum  = fadd float %r0, %r0d
+  %result_scaled = fmul float %rsum, 5.000000e-01
+
+  ; undo the scaling (no-op when x was already normal: scale_down = 1.0)
+  %result = fmul float %result_scaled, %scale_down
+  br label %ret_val
+
+silence_nan:
+  ; quiet the NaN by setting the most-significant mantissa bit (bit 22),
+  ; which silences a signaling NaN while preserving its sign and payload
+  %nan_bits    = bitcast float %x to i32
+  %quiet_bits  = or i32 %nan_bits, 4194304        ; 0x00400000
+  %quiet_nan   = bitcast i32 %quiet_bits to float
+  ret float %quiet_nan
+
+ret_nan:
+  %nan = fdiv float 0.000000e+00, 0.000000e+00   ; generate qNaN, no hex literal needed
+  ret float %nan
+
+ret_x:
+  ret float %x
+
+ret_val:
+  ret float %result
+}
+
+define i64 @llvm.ctpop.i64(i64 %x) {
+entry:
+    ; Step 1: x = x - ((x >> 1) & 0x5555555555555555)
+    ; Counts groups of 2 bits
+    %shift1 = lshr i64 %x, 1
+    %mask1  = and i64 %shift1, 6148914691236517205 ; 0x5555555555555555
+    %step1  = sub i64 %x, %mask1
+
+    ; Step 2: x = (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333)
+    ; Counts groups of 4 bits
+    %mask2_1 = and i64 %step1, 3689348814741910323 ; 0x3333333333333333
+    %shift2  = lshr i64 %step1, 2
+    %mask2_2 = and i64 %shift2, 3689348814741910323 ; 0x3333333333333333
+    %step2   = add i64 %mask2_1, %mask2_2
+
+    ; Step 3: x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0F
+    ; Counts groups of 8 bits
+    %shift3  = lshr i64 %step2, 4
+    %sum3    = add i64 %step2, %shift3
+    %step3   = and i64 %sum3, 1085102592571150095  ; 0x0F0F0F0F0F0F0F0F
+
+    ; Step 4: x = x + (x >> 8)
+    %shift4  = lshr i64 %step3, 8
+    %step4   = add i64 %step3, %shift4
+
+    ; Step 5: x = x + (x >> 16)
+    %shift5  = lshr i64 %step4, 16
+    %step5   = add i64 %step4, %shift5
+
+    ; Step 6: x = x + (x >> 32)
+    %shift6  = lshr i64 %step5, 32
+    %step6   = add i64 %step5, %shift6
+
+    ; Step 7: Mask the final 6 bits (max value is 64, which fits in 0x3f)
+    %result  = and i64 %step6, 63                   ; 0x000000000000003F
+    ret i64 %result
+}
